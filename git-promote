@@ -1,6 +1,6 @@
 #!/bin/sh
 #------------------------------------------------------------------------------
-# $Header: git-promote,v 1.13 2013/05/10 10:20:31 bosisio Exp $
+# $Header: git-promote,v 1.14 2013/09/09 11:01:32 bosisio Exp $
 #------------------------------------------------------------------------------
 
 function Info {
@@ -19,9 +19,10 @@ function Usage {
   local PROGRAM=$(basename $0 | /bin/sed 's/-/ /')
   /bin/cat >&2 << HERE
 
-	[1;7m USAGE: ${PROGRAM} [<commit-message>] [--test] [--no-interact] [m
-			   [1;7m [--stop-at=<branch>] [--backward=<branch>] [m
-			   [1;7m [-stay=<branch>] [-author=<username>] [m
+	[1;7m USAGE: ${PROGRAM} [-m <commit-message>] [--test] [--no-interact] [m
+			   [1;7m [--already-in=<branch>] [--skip-from=<branch>] [m
+			   [1;7m [--backward=<branch>] [--edit] [m
+                           [1;7m [-stay=<branch>] [-author=<username>] [m
 
 		Merge current branch into all subsequent branches,
 		one by one and in the proper order.
@@ -32,14 +33,18 @@ function Usage {
 		Each merge step includes running 'git mergetool' if needed
 		and can be verifyed or stopped before it is completed.
 
-	 <commit-message> : if omitted, it is taken from last commit
-	 --test           : just print the commands, instead of executing them
-	 --no-interact    : do not ask for confirmation after each merge
-	 --stop-at=<br>   : when reached branch <br>, do "merge -X ours" and stop
-	 --backward=<br>  : cherry-pick last commit to branch <br>
-			    (implies "--stop-at=<current-branch>")
-	 -stay=<br>       : leave <br> active (do not go back to original one)
-	 -author=<user>   : use given <username> as author (name and e-mail)
+	 -m "<commit-msg>" : if omitted, message is taken from last commit
+	 --test            : just print the commands, instead of executing them
+	 --no-interact     : do not ask for confirmation after each merge
+	 --already-in=<br> : when branch <br> reached, do "merge -X ours" and
+                             stop (since change is ALREADY PRESENT in <br>)
+	 --skip-from=<br>  : when branch <br> reached, do "merge -s ours" and
+                             stop (since change is NOT DESIRED in <br>)
+	 --backward=<br>   : cherry-pick last commit to branch <br> and then
+			     promote (implies "--already-in=<current-branch>")
+	 --edit            : let the user modify the files after each merge step
+         -stay=<br>        : leave <br> active (do not go back to original one)
+	 -author=<user>    : use given <username> as author (name and e-mail)
 
 HERE
   exit $1
@@ -103,6 +108,18 @@ function do_git_merge {
 
   SubInfo "Running 'git mergetool' if needed"
   ${RUN} git mergetool
+
+  if [ "${EDIT_MERGE}" ]; then
+    ask_for_confirmation 'Do you want to edit merged files before proceeding ?'
+    if [ $? -eq 0 ]; then # Answer is 'Y'
+      local FILES=$(git status | \
+                    /bin/awk '/modified:|new file:/{ printf "%s ",$3 }')
+      ${RUN} ${EDITOR:-vi} ${FILES}
+      printf '\tPress ENTER to continue ...\n'
+      read
+      ${RUN} git add ${FILES}
+    fi
+  fi
 
   printf "\nYou can now ${B}commit${N} the merge, leave it ${B}pending${N}"
   printf " or ${B}abort${N} it.\n"
@@ -173,16 +190,19 @@ function read_branch_config {
   git --no-pager show "${BRANCH}:branch.config"
   if [ $? -ne 0 ]; then
     BRANCH_CONFIG_FAILURE=1
-    exit ?$
+    exit $?
   fi
 }
 
 #------------------------------------------------------------------------------
 
-unset GIT_AUTHOR FINAL_BRANCH RUN NON_INTERACTIVE STOP_AT_BRANCH BACKWARD_TO
+unset GIT_AUTHOR FINAL_BRANCH RUN NON_INTERACTIVE STOP_AT_BRANCH STOP_AT_FLAG
+unset BACKWARD_TO EDIT_MERGE M_FLAG
 for ARG in "$@"; do
+  [ "${M_FLAG}" = '1' ] && M_FLAG=2
   case "${ARG}" in
-    -?|-h|-help|--help) Usage 0 ;;
+    -\?|-h|-help|--help) Usage 0 ;;
+    -m) M_FLAG=1 ;;
     -author=*) GIT_AUTHOR=${ARG#-author=}
                GITCFG="/users/${GIT_AUTHOR}/.gitconfig"
                GITNAME=$(/bin/awk '/^[ \t]*name[ \t]*=/{ print $3,$4 }' ${GITCFG})
@@ -192,13 +212,28 @@ for ARG in "$@"; do
     -stay=*) FINAL_BRANCH=${ARG#-stay=} ;;
     --test) RUN=echo ;;
     --no-interact) NON_INTERACTIVE=1 ;;
-    --stop-at=*) STOP_AT_BRANCH=${ARG#--stop-at=} ;;
+    --already-in=*) STOP_AT_BRANCH=${ARG#--already-in=}
+                    STOP_AT_FLAG='X' ;;
+    --skip-from=*) STOP_AT_BRANCH=${ARG#--skip-from=}
+                   STOP_AT_FLAG='s' ;;
     --backward=*) BACKWARD_TO=${ARG#--backward=} ;;
+    --edit) EDIT_MERGE=1 ;;
     -*) printf 'Unknown option "%s" !\n' "${ARG}" >&2
         Usage 1 ;;
-    *) MESSAGE="${ARG}"
+    *) if [ "${M_FLAG}" = '2' ]; then
+         MESSAGE="${ARG}"
+         unset M_FLAG
+       else
+         printf 'Unknown argument "%s" (forgot "-m" ?) !\n' "${ARG}" >&2
+         Usage 2
+       fi
   esac
 done
+if [ "${M_FLAG}" ]; then
+  printf 'Missing argument after "-m" !\n' >&2
+  Usage 3
+fi
+unset M_FLAG
 
 # Check commit message ...
 if [ -z "${MESSAGE}" ]; then
@@ -223,8 +258,8 @@ ACTIVE=$(git --no-pager branch | /bin/grep '^\*' | \
 START_BR="${ACTIVE}"
 if [ "${BACKWARD_TO}" ]; then
   if [ -z "${STOP_AT_BRANCH}" ]; then
-    printf '\tProcess will stop (with "merge -X ours") at branch "%s".\n' \
-           "${ACTIVE}"
+    printf '\tProcess will stop (with "merge -%s ours") at branch "%s".\n' \
+           "${STOP_AT_FLAG}" "${ACTIVE}"
     STOP_AT_BRANCH="${ACTIVE}"
   fi
   START_BR="${BACKWARD_TO}"
@@ -241,7 +276,7 @@ MATCHED=$(BR="${START_BR}"; \
           done)
 
 CURRENT=$(read_branch_config "${BR}" | /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
-if [ "${BRANCH_CONFIG_FAILURE}" ];then
+if [ "${BRANCH_CONFIG_FAILURE}" ]; then
   printf '\n\tCannot read config file for some branch:\n\t%s !\n' \
          'try "git align-branches" first' >&2
   exit 4
@@ -319,7 +354,7 @@ else
     unset MERGE_OPT
     MERGE_TYPE='Merg'
     if [ "${BR}" = "${STOP_AT_BRANCH}" ]; then
-       MERGE_OPT=' -X ours'
+       MERGE_OPT=" -${STOP_AT_FLAG} ours"
        MERGE_TYPE='(No)merg'
     fi
     Info "${MERGE_TYPE}ing '${PREV}' --> '${BR}'[33m${MERGE_OPT}[30m"

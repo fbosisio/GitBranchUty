@@ -1,0 +1,369 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# $Header: git-promote,v 1.13 2013/05/10 10:20:31 bosisio Exp $
+#------------------------------------------------------------------------------
+
+function Info {
+  printf '\t[30;41m %s ... [m\n' "$@"
+}
+
+#------------------------------------------------------------------------------
+
+function SubInfo {
+  printf '\t\t[33;40m %s ... [m\n' "$@"
+}
+
+#------------------------------------------------------------------------------
+
+function Usage {
+  local PROGRAM=$(basename $0 | /bin/sed 's/-/ /')
+  /bin/cat >&2 << HERE
+
+	[1;7m USAGE: ${PROGRAM} [<commit-message>] [--test] [--no-interact] [m
+			   [1;7m [--stop-at=<branch>] [--backward=<branch>] [m
+			   [1;7m [-stay=<branch>] [-author=<username>] [m
+
+		Merge current branch into all subsequent branches,
+		one by one and in the proper order.
+		Commit message will include given message, beside merge info.
+		A preliminary 'pull' on all subsequent branches is
+		automatically performed; at the end, current branch and all
+		subsequent ones are pushed to the remote repository.
+		Each merge step includes running 'git mergetool' if needed
+		and can be verifyed or stopped before it is completed.
+
+	 <commit-message> : if omitted, it is taken from last commit
+	 --test           : just print the commands, instead of executing them
+	 --no-interact    : do not ask for confirmation after each merge
+	 --stop-at=<br>   : when reached branch <br>, do "merge -X ours" and stop
+	 --backward=<br>  : cherry-pick last commit to branch <br>
+			    (implies "--stop-at=<current-branch>")
+	 -stay=<br>       : leave <br> active (do not go back to original one)
+	 -author=<user>   : use given <username> as author (name and e-mail)
+
+HERE
+  exit $1
+}
+
+#------------------------------------------------------------------------------
+
+function ask_for_confirmation {
+  local MSG="$1"
+  local FORCE="$2"
+  [ "${NON_INTERACTIVE}" -a -z "${FORCE}" ] && return 0
+  local ANSWER
+  while /bin/true; do
+    printf '%s [Y/N] » ' "${MSG}"
+    read ANSWER
+    case "${ANSWER}" in
+      y|Y) return 0 ;;
+      n|N) return 1 ;;
+      *) # Repeat the loop
+    esac
+  done
+}
+
+#------------------------------------------------------------------------------
+
+function run_git_commit {
+  local COMMIT_MSG="$1"
+  if [ "${GIT_AUTHOR}" ]; then
+    ${RUN} git commit -m "${COMMIT_MSG}" "${GIT_AUTHOR}"
+  else
+    ${RUN} git commit -m "${COMMIT_MSG}"
+  fi
+  if [ $? -ne 0 ]; then
+    printf 'ERROR: "git commit" failed - merge aborted !\n' >&2
+    exit 3
+  fi
+}
+
+#------------------------------------------------------------------------------
+
+function do_git_merge {
+  local NEW_REV="$1"
+  local OLD_REV="$2"
+  local MSG="$3"
+  local MERG_TYPE="$4"
+  local OPTS="$5"
+  local B='[30;42m'
+  local N='[m'
+
+  SubInfo "Checking-out branch '${NEW_REV}'"
+  ${RUN} git checkout "${NEW_REV}"
+
+  #SubInfo "Re-running 'git pull' to make sure branch is aligned"
+  #${RUN} git pull
+
+  SubInfo "Merging branch '${OLD_REV}' into '${NEW_REV}'"
+  ${RUN} git merge "${OLD_REV}" --no-commit ${OPTS}
+
+  SubInfo "Showing 'git status'"
+  ${RUN} git status
+
+  SubInfo "Running 'git mergetool' if needed"
+  ${RUN} git mergetool
+
+  printf "\nYou can now ${B}commit${N} the merge, leave it ${B}pending${N}"
+  printf " or ${B}abort${N} it.\n"
+  ask_for_confirmation 'Proceed with merge ?'
+  if [ $? -ne 0 ]; then # Answer is 'N'
+    printf 'OK, going to stop the "promote" process.\n'
+    printf 'But what do you want to do with current merge step?\n'
+    printf ' - cancel it (you need to REDO the merge manually then !)\n'
+    printf ' - leave it pending (you can make changes and commit the merge).\n'
+    ask_for_confirmation 'Undo merge and revert to original state ?'
+    if [ $? -eq 0 ]; then # Second answer is 'Y'
+      Info "Undoing merge with 'git merge --abort'"
+      ${RUN} git merge --abort
+      Info "Re-showing 'git status'"
+      ${RUN} git status
+    else  # Second answer is 'N'
+      printf '\nWARNING: leaving the merge pending as requested !\n\t '
+      printf '(complete with "git commit" or undo with "git merge --abort")\n\n'
+    fi
+    exit 2
+  fi
+
+  SubInfo "Running 'git commit' to conclude merge"
+  run_git_commit "${MERG_TYPE}ed ${OLD_REV} into ${NEW_REV} (${MSG})"
+}
+
+#------------------------------------------------------------------------------
+
+function git_ff_merge {
+  local BRANCH="$1"
+  local COMMIT="$2"
+
+  local BRANCH_HASH=$(git show-ref -s --verify "refs/heads/${BRANCH}" 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    printf "Error: unknown BRANCH ${BRANCH}\n" >&2
+    return 1
+  fi
+
+  local COMMIT_HASH=$(git rev-parse --verify --quiet "${COMMIT}")
+  if [ $? -ne 0 ]; then
+    printf "Error: unknown revision ${COMMIT}\n" >&2
+    return 2
+  fi
+
+  local BASE_HASH=$(git merge-base "${BRANCH_HASH}" "${COMMIT_HASH}")
+  if [ "${BASE_HASH}" != "${BRANCH_HASH}" ]; then
+    printf "WARNING: merging ${COMMIT} into ${BRANCH} would not be a fast-forward\n" >&2
+    return 3
+  fi
+  local BRANCH_SHORT_HASH=$(echo "${BRANCH_HASH}" | sed 's/^\(.......\).*$/\1/')
+  local COMMIT_SHORT_HASH=$(echo "${COMMIT_HASH}" | sed 's/^\(.......\).*$/\1/')
+  printf "Updating ${BRANCH_SHORT_HASH}..${COMMIT_SHORT_HASH}\n"
+  git update-ref -m "merge ${COMMIT}: Fast forward" "refs/heads/${BRANCH}" \
+                    "${COMMIT_HASH}" "${BRANCH_HASH}"
+  if [ $? -ne 0 ]; then
+    printf 'Error: fast forward using update-ref failed\n' >&2
+    return 4
+  fi
+  printf 'Fast forward\n'
+  git --no-pager diff --stat "${BRANCH}@{1}" "${BRANCH}"
+  [ $? -eq 0 ] || printf 'Warning: "git diff" failed\n'
+}
+
+#------------------------------------------------------------------------------
+
+function read_branch_config {
+  local BRANCH="$1"
+  git --no-pager show "${BRANCH}:branch.config"
+  if [ $? -ne 0 ]; then
+    BRANCH_CONFIG_FAILURE=1
+    exit ?$
+  fi
+}
+
+#------------------------------------------------------------------------------
+
+unset GIT_AUTHOR FINAL_BRANCH RUN NON_INTERACTIVE STOP_AT_BRANCH BACKWARD_TO
+for ARG in "$@"; do
+  case "${ARG}" in
+    -?|-h|-help|--help) Usage 0 ;;
+    -author=*) GIT_AUTHOR=${ARG#-author=}
+               GITCFG="/users/${GIT_AUTHOR}/.gitconfig"
+               GITNAME=$(/bin/awk '/^[ \t]*name[ \t]*=/{ print $3,$4 }' ${GITCFG})
+               GITMAIL=$(/bin/awk '/^[ \t]*email[ \t]*=/{ print $3 }' ${GITCFG})
+               GIT_AUTHOR="--author=${GITNAME} <${GITMAIL}>"
+               unset GITCFG GITNAME GITMAIL ;;
+    -stay=*) FINAL_BRANCH=${ARG#-stay=} ;;
+    --test) RUN=echo ;;
+    --no-interact) NON_INTERACTIVE=1 ;;
+    --stop-at=*) STOP_AT_BRANCH=${ARG#--stop-at=} ;;
+    --backward=*) BACKWARD_TO=${ARG#--backward=} ;;
+    -*) printf 'Unknown option "%s" !\n' "${ARG}" >&2
+        Usage 1 ;;
+    *) MESSAGE="${ARG}"
+  esac
+done
+
+# Check commit message ...
+if [ -z "${MESSAGE}" ]; then
+  MESSAGE=$(git --no-pager log -1 --pretty=format:%s%n | \
+            /bin/sed -e 's/Merged* [^ ]* into [^ ]* (//' -e 's/ *)$//')
+fi
+while /bin/true; do
+  printf 'The following commit-message will be used:\n\t[1;7m%s[m\n' \
+         "${MESSAGE}"
+  ask_for_confirmation 'Do you confirm the message ?' '-force'
+  [ $? -eq 0 ] && break # If answer is 'Y', stop loop
+  unset MESSAGE
+  while [ -z "${MESSAGE}" ]; do
+    printf 'Insert a commit-message (CTRL-C to abort) : '
+    read MESSAGE
+  done
+done
+
+ACTIVE=$(git --no-pager branch | /bin/grep '^\*' | \
+         /bin/sed -e 's/\* //' -e 's///')
+
+START_BR="${ACTIVE}"
+if [ "${BACKWARD_TO}" ]; then
+  if [ -z "${STOP_AT_BRANCH}" ]; then
+    printf '\tProcess will stop (with "merge -X ours") at branch "%s".\n' \
+           "${ACTIVE}"
+    STOP_AT_BRANCH="${ACTIVE}"
+  fi
+  START_BR="${BACKWARD_TO}"
+fi
+
+unset BRANCH_CONFIG_FAILURE
+MATCHED=$(BR="${START_BR}"; \
+          while /bin/true; do \
+            BR=$(read_branch_config "${BR}" | \
+                 /bin/awk '/^[ \t]*NEXT/{ print $3 }'); \
+            [ -z "${BR}" -o "${BR}" = 'none' -o "${BR}" = 'master' ] && break; \
+            printf '%s ' "${BR}"; \
+            [ "${BR}" = "${STOP_AT_BRANCH}" ] && break; \
+          done)
+
+CURRENT=$(read_branch_config "${BR}" | /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
+if [ "${BRANCH_CONFIG_FAILURE}" ];then
+  printf '\n\tCannot read config file for some branch:\n\t%s !\n' \
+         'try "git align-branches" first' >&2
+  exit 4
+fi
+
+# Check for (local) user's branch ...
+if [ "${ACTIVE}" != "${CURRENT}" ]; then
+  printf 'WARNING: current branch "%s" appears to be a sub-branch of "%s".\n' \
+         "${ACTIVE}" "${CURRENT}" >&2
+  ask_for_confirmation "Do you want to merge '${ACTIVE}' into '${CURRENT}' ?" \
+                       '-force'
+  if [ $? -eq 0 ]; then # Answer is 'Y'
+    MATCHED="${CURRENT} ${MATCHED}"
+  else # Answer is 'N'
+    printf 'Command aborted as requested.\n'
+    exit 0
+  fi
+fi
+
+if [ "${BACKWARD_TO}" ]; then
+  Info "Cherry-picking last commit into branch '${BACKWARD_TO}'"
+  COMMIT_ID=$(git --no-pager log -1 --pretty=format:%H)
+  SHORT_COMMIT=$(echo "${COMMIT_ID}" | /usr/bin/cut -c1-7)
+  ask_for_confirmation "Do you want to cherry-pick commit '${SHORT_COMMIT}' ?" \
+                       '-force'
+  if [ $? -eq 0 ]; then # Answer is 'Y'
+    SubInfo "Running 'git checkout ${BACKWARD_TO}'"
+    git checkout "${BACKWARD_TO}"
+    SubInfo "Running 'git cherry-pick'"
+    git cherry-pick "${COMMIT_ID}"
+  else # Answer is 'N'
+    printf 'Command aborted as requested.\n'
+    exit 0
+  fi
+fi
+
+if [ -z "${MATCHED}" ]; then
+  Info "No next branch to merge"
+  ask_for_confirmation 'Do you want to push current branch ?' '-force'
+  if [ $? -eq 0 ]; then # Answer is 'Y'
+    SubInfo "Running 'git push'"
+    ${RUN} git push
+    if [ $? -ne 0 ]; then
+      SubInfo "Push failed: trying a 'git pull' first"
+      ${RUN} git pull --no-commit
+      SubInfo "Commiting the pull merge"
+      REMOTE=$(git remote -v | \
+               /bin/awk '/(fetch)/{ sub("^.*@",""); sub("\\..*",""); print }')
+      run_git_commit "Merge remote branch ${ACTIVE} of ${REMOTE} into ${ACTIVE} (${MESSAGE})"
+      SubInfo "Running 'git push' again"
+      ${RUN} git push
+    fi
+
+    BR='master'
+    SubInfo "Fast-forwarding '${ACTIVE}' --> '${BR}'"
+    git_ff_merge "${BR}" "${ACTIVE}"
+    if [ $? -eq 0 ]; then
+      SubInfo "Running 'git push ${BR}'"
+      ${RUN} git push origin "${BR}"
+    fi
+  else # Answer is 'N'
+    printf "Manually run '[1;7m%s[m'\n" 'git push'
+  fi
+else
+  Info "Pulling branches from remote repository"
+  SubInfo "Running 'git align-branches ${MATCHED}'"
+  ${RUN} git align-branches ${MATCHED}
+  if [ $? -ne 0 ]; then
+    printf '\n\tERROR: git align-branches failed !\n\n' >&2
+    exit 1
+  fi
+
+  PREV=${ACTIVE}
+  for BR in ${MATCHED}; do
+    unset MERGE_OPT
+    MERGE_TYPE='Merg'
+    if [ "${BR}" = "${STOP_AT_BRANCH}" ]; then
+       MERGE_OPT=' -X ours'
+       MERGE_TYPE='(No)merg'
+    fi
+    Info "${MERGE_TYPE}ing '${PREV}' --> '${BR}'[33m${MERGE_OPT}[30m"
+    do_git_merge "${BR}" "${PREV}" "${MESSAGE}" "${MERGE_TYPE}" "${MERGE_OPT}"
+    #[ "${BR}" = "${STOP_AT_BRANCH}" ] && break
+    PREV="${BR}"
+  done
+  if [ -z "${STOP_AT_BRANCH}" ]; then
+    BR='master'
+    Info "Fast-forwarding '${PREV}' --> '${BR}'"
+    git_ff_merge "${BR}" "${PREV}"
+  fi
+
+  FINAL_OR_ORIGINAL='final'
+  if [ -z "${FINAL_BRANCH}" ]; then
+    FINAL_BRANCH="${ACTIVE}"
+    FINAL_OR_ORIGINAL='original'
+  fi
+  Info "Reverting back to ${FINAL_OR_ORIGINAL} branch '${FINAL_BRANCH}'"
+  SubInfo "Running 'git checkout ${FINAL_BRANCH}'"
+  ${RUN} git checkout ${FINAL_BRANCH}
+
+  Info "Pushing all branches to remote repository"
+  printf '\nYou shall now push all changed branches to the remote repository.\n'
+  ask_for_confirmation 'Proceed with push ?' '-force'
+  if [ $? -eq 0 ]; then # Answer is 'Y'
+    SubInfo "Running 'git align-branches --push ${ACTIVE} ${MATCHED}'"
+    ${RUN} git align-branches --push ${ACTIVE} ${MATCHED}
+    if [ $? -ne 0 ]; then
+      printf '\n\tERROR: git align-branches --push failed !\n\n' >&2
+      exit 5
+    fi
+
+    if [ -z "${STOP_AT_BRANCH}" ]; then
+      BR='master'
+      SubInfo "Fast-forwarding '${PREV}' --> '${BR}' again"
+      git_ff_merge "${BR}" "${PREV}"
+      if [ $? -eq 0 ]; then
+        SubInfo "Running 'git push ${BR}'"
+        ${RUN} git push origin "${BR}"
+      fi
+    fi
+  else # Answer is 'N'
+    printf "Manually run '[1;7m%s[m'\n" \
+           "git align-branches --push ${ACTIVE} ${MATCHED}"
+  fi
+fi

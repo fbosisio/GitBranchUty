@@ -196,6 +196,10 @@ function read_branch_config {
 
 #------------------------------------------------------------------------------
 
+# Avoid problem with "strange" user settigns ...
+unset ENV
+export PS1='$ '
+
 unset GIT_AUTHOR FINAL_BRANCH RUN NON_INTERACTIVE STOP_AT_BRANCH STOP_AT_FLAG
 unset BACKWARD_TO EDIT_MERGE M_FLAG
 for ARG in "$@"; do

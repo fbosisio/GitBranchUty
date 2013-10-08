@@ -34,6 +34,7 @@ sub new {
   my $self = { verbose        => 0,
                stopOnErrors   => TRUE,
                chompScalars   => TRUE,
+               printOnly      => FALSE,
                _lastCmdFailed => FALSE,
                _openHandles   => {} };
 
@@ -66,6 +67,9 @@ sub Options {
               " package !\n" );
     }
   } # END foreach
+
+  # The 'printOnly' option implies the 'verbose' one
+  $self->{verbose} = 1 if ( $self->{printOnly} && ($self->{verbose} <= 0) );
 
   # Evaluate the proper return-value, if requested
   if ( defined wantarray ) { # Non-void context
@@ -116,16 +120,18 @@ my $OpenFailed = sub {
 my $CloseFailed = sub {
   my( $self, $git_cmd ) = @_;
 
-  my $msg = ( $! ? "Failure in 'git $git_cmd': $!" :
-                   "Exit code from 'git $git_cmd' is $?" );
+  if ( $self->{stopOnErrors} ) {
+    my $msg = ( $! ? "Failure in 'git $git_cmd': $!" :
+                     "Exit code from 'git $git_cmd' is $?" );
 
-  &croak( "$msg\n" ) if ( $self->{stopOnErrors} );
+    &croak( "$msg\n" );
+  }
   $self->{_lastCmdFailed} = TRUE;
 };
 
 #------------------------------------------------------------------------------
 # Execute the given git-command and place its standard output either on STDOUT,
-# on a list (one elem per line), on a single string (concaenating al lines) or
+# on a list (one elem per line), on a single string (concatenating all lines) or
 # in a given file-handle (to be processed by the caller).
 #-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 sub Run {
@@ -139,7 +145,8 @@ sub Run {
   my $cmd = $command . ' ' . join(' ',@args);
   $cmd =~ s/\s+$//;
   print STDERR '[',ref($self),"] About to run 'git $cmd' ...\n" if ( $self->{verbose} > 0 );
-  $cmd = "$git_executable --no-pager $cmd";
+  # If 'printOnly' option is set, use a "do-nothing" command instead of 'git'
+  $cmd = ( $self->{printOnly} ? 'cd .' : "$git_executable --no-pager $cmd" );
 
   $self->{_lastCmdFailed} = FALSE; # Reset state
 
@@ -176,6 +183,7 @@ sub Close {
 #   - git COMMAND ARGUMENTS
 #   - perl -MGitCmd -e '$git=new GitCmd; $git->COMMAND(ARGUMENTS);'
 # no matter what "COMMAND" is (built-in, add-on, alias or invalid name).
+# Notice also that dashes (-) are replaced by underscores (_) inside "COMMAND".
 #-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 sub AUTOLOAD {
   # Remove package from name
@@ -238,7 +246,7 @@ written this way).
 The module provides some explicit methods (namely B<new>, B<Option>, B<KO>,
 B<ReturnListOrString>, B<Run> and B<Close>) plus an B<AUTOLOAD> facility so
 that I<every> GIT command can be used as a method (just with dashes converted
-to undercores in the name to cope with perl syntax). In other words, the
+to undercores in the name, to cope with perl syntax). In other words, the
 following perl snippet:
 
    use GitCmd;
@@ -325,7 +333,7 @@ will be saved in a list (each line goes into a different list element):
 
 =item *
 
-If the return value is a scalar, the outut of given git-command will be placed
+If the return value is a scalar, the output of given git-command will be placed
 in a string, i.e. all lines will be concateneted together (the last newline will
 be removed if the I<chompScalars> option is set, which is the default):
 
@@ -366,7 +374,7 @@ Multiple open commands at the same time are supported: this is why you need to
 pass the file-handle again to this method.
 
 TODO: as a special case, we could accept a call to Close with no args, if
-just one file-handle is currently open
+just one file-handle is currently opened
 
 =head2 AUTOLOAD
 
@@ -380,7 +388,7 @@ but git commands use them.
 In other words, any call to "GitCmd::xy_zt( 'a', 'b' )" is mapped into a call
 to "GitCmd::Run( 'xy-zt', 'a', 'b' )", which ends up in calling "git xy-zt a b".
 The same rules for the I<Run> command applies for output parsing, depending on
-whether there is a return-value or not, on its type (scalar or list context
+whether there is a return-value or not, on its type (scalar or list context)
 and maybe the usage of an "IO::Handle" object as first argument.
 
 =over

@@ -104,7 +104,7 @@ function do_git_merge {
   ${RUN} git merge "${OLD_REV}" --no-commit ${OPTS}
 
   SubInfo "Showing 'git status'"
-  ${RUN} git status
+  ${RUN} git status -uno
 
   SubInfo "Running 'git mergetool' if needed"
   ${RUN} git mergetool
@@ -134,7 +134,7 @@ function do_git_merge {
       Info "Undoing merge with 'git merge --abort'"
       ${RUN} git merge --abort
       Info "Re-showing 'git status'"
-      ${RUN} git status
+      ${RUN} git status -uno
     else  # Second answer is 'N'
       printf '\nWARNING: leaving the merge pending as requested !\n\t '
       printf '(complete with "git commit" or undo with "git merge --abort")\n\n'
@@ -286,17 +286,19 @@ if [ "${BRANCH_CONFIG_FAILURE}" ]; then
   exit 4
 fi
 
-# Check for (local) user's branch ...
-if [ "${ACTIVE}" != "${CURRENT}" ]; then
-  printf 'WARNING: current branch "%s" appears to be a sub-branch of "%s".\n' \
-         "${ACTIVE}" "${CURRENT}" >&2
-  ask_for_confirmation "Do you want to merge '${ACTIVE}' into '${CURRENT}' ?" \
-                       '-force'
-  if [ $? -eq 0 ]; then # Answer is 'Y'
-    MATCHED="${CURRENT} ${MATCHED}"
-  else # Answer is 'N'
-    printf 'Command aborted as requested.\n'
-    exit 0
+if [ -z "${BACKWARD_TO}" ]; then
+  # Check for (local) user's branch ...
+  if [ "${ACTIVE}" != "${CURRENT}" ]; then
+    printf 'WARNING: current branch "%s" appears to be a sub-branch of "%s".\n' \
+           "${ACTIVE}" "${CURRENT}" >&2
+    ask_for_confirmation "Do you want to merge '${ACTIVE}' into '${CURRENT}' ?" \
+                         '-force'
+    if [ $? -eq 0 ]; then # Answer is 'Y'
+      MATCHED="${CURRENT} ${MATCHED}"
+    else # Answer is 'N'
+      printf 'Command aborted as requested.\n'
+      exit 0
+    fi
   fi
 fi
 
@@ -310,7 +312,13 @@ if [ "${BACKWARD_TO}" ]; then
     SubInfo "Running 'git checkout ${BACKWARD_TO}'"
     git checkout "${BACKWARD_TO}"
     SubInfo "Running 'git cherry-pick'"
-    git cherry-pick "${COMMIT_ID}"
+    git cherry-pick --no-commit "${COMMIT_ID}"
+    SubInfo "Showing 'git status'"
+    ${RUN} git status -uno
+    SubInfo "Running 'git mergetool' if needed"
+    ${RUN} git mergetool
+    SubInfo "Running 'git commit' to conclude merge"
+    run_git_commit "cherry-pick of ${SHORT_COMMIT} (${MSG})"
   else # Answer is 'N'
     printf 'Command aborted as requested.\n'
     exit 0

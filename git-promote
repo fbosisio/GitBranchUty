@@ -1,6 +1,6 @@
 #!/bin/sh
 #------------------------------------------------------------------------------
-# $Header: git-promote,v 1.14 2013/09/09 11:01:32 bosisio Exp $
+# $Id: git-promote,v 1.14 2013/09/09 11:01:32 bosisio Exp $
 #------------------------------------------------------------------------------
 
 function Info {
@@ -185,11 +185,22 @@ function git_ff_merge {
 
 #------------------------------------------------------------------------------
 
+function run_with_stderr_logging {
+  local STDERR_FILE="$1"
+  shift
+  # The sequence "3>&1 1>&2 2>&3" swaps stdout and stderr
+  # The usage of a sub-shell allows swapping them back after "tee" invocation
+  ("$@" 3>&1 1>&2 2>&3 | /usr/bin/tee "${STDERR_FILE}") 3>&1 1>&2 2>&3
+}
+
+#------------------------------------------------------------------------------
+
 function read_branch_config {
   local BRANCH="$1"
-  git --no-pager show "${BRANCH}:branch.config"
+  local GIT_ERRORS_FILE="$2"
+  run_with_stderr_logging "${GIT_ERRORS_FILE}" git --no-pager show \
+        "remotes/origin/${BRANCH}:branch.config"
   if [ $? -ne 0 ]; then
-    BRANCH_CONFIG_FAILURE=1
     exit $?
   fi
 }
@@ -269,22 +280,26 @@ if [ "${BACKWARD_TO}" ]; then
   START_BR="${BACKWARD_TO}"
 fi
 
-unset BRANCH_CONFIG_FAILURE
+BRANCH_CONFIG_FAILURE_FILE="git_branch_config.$$.err"
+> "${BRANCH_CONFIG_FAILURE_FILE}"
 MATCHED=$(BR="${START_BR}"; \
           while /bin/true; do \
-            BR=$(read_branch_config "${BR}" | \
+            BR=$(read_branch_config "${BR}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
                  /bin/awk '/^[ \t]*NEXT/{ print $3 }'); \
             [ -z "${BR}" -o "${BR}" = 'none' -o "${BR}" = 'master' ] && break; \
             printf '%s ' "${BR}"; \
             [ "${BR}" = "${STOP_AT_BRANCH}" ] && break; \
           done)
-
-CURRENT=$(read_branch_config "${BR}" | /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
-if [ "${BRANCH_CONFIG_FAILURE}" ]; then
+if [ -s "${BRANCH_CONFIG_FAILURE_FILE}" ]; then
+  /bin/rm -f "${BRANCH_CONFIG_FAILURE_FILE}"
   printf '\n\tCannot read config file for some branch:\n\t%s !\n' \
          'try "git align-branches" first' >&2
   exit 4
 fi
+
+CURRENT=$(read_branch_config "${START_BR}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
+          /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
+/bin/rm -f "${BRANCH_CONFIG_FAILURE_FILE}"
 
 if [ -z "${BACKWARD_TO}" ]; then
   # Check for (local) user's branch ...

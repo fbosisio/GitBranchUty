@@ -296,6 +296,15 @@ if [ -s "${BRANCH_CONFIG_FAILURE_FILE}" ]; then
          'try "git align-branches" first' >&2
   exit 4
 fi
+MATCHED=${MATCHED% }
+LAST_BRANCH=${MATCHED##* }
+NEXT_OF_LAST=$(read_branch_config "${LAST_BRANCH}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
+               /bin/awk '/^[ \t]*NEXT/{ print $3 }');
+unset UPDATE_MASTER_BRANCH
+if [ "${NEXT_OF_LAST}" = 'master' ]; then
+  UPDATE_MASTER_BRANCH=1
+fi
+unset LAST_BRANCH NEXT_OF_LAST
 
 CURRENT=$(read_branch_config "${START_BR}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
           /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
@@ -357,12 +366,14 @@ if [ -z "${MATCHED}" ]; then
       ${RUN} git push
     fi
 
-    BR='master'
-    SubInfo "Fast-forwarding '${ACTIVE}' --> '${BR}'"
-    git_ff_merge "${BR}" "${ACTIVE}"
-    if [ $? -eq 0 ]; then
-      SubInfo "Running 'git push ${BR}'"
-      ${RUN} git push origin "${BR}"
+    if [ "${UPDATE_MASTER_BRANCH}" ]; then
+      BR='master'
+      SubInfo "Fast-forwarding '${ACTIVE}' --> '${BR}'"
+      git_ff_merge "${BR}" "${ACTIVE}"
+      if [ $? -eq 0 ]; then
+        SubInfo "Running 'git push ${BR}'"
+        ${RUN} git push origin "${BR}"
+      fi
     fi
   else # Answer is 'N'
     printf "Manually run '[1;7m%s[m'\n" 'git push'
@@ -389,7 +400,7 @@ else
     #[ "${BR}" = "${STOP_AT_BRANCH}" ] && break
     PREV="${BR}"
   done
-  if [ -z "${STOP_AT_BRANCH}" ]; then
+  if [ -z "${STOP_AT_BRANCH}" -a "${UPDATE_MASTER_BRANCH}" ]; then
     BR='master'
     Info "Fast-forwarding '${PREV}' --> '${BR}'"
     git_ff_merge "${BR}" "${PREV}"
@@ -415,7 +426,7 @@ else
       exit 5
     fi
 
-    if [ -z "${STOP_AT_BRANCH}" ]; then
+    if [ -z "${STOP_AT_BRANCH}" -a "${UPDATE_MASTER_BRANCH}" ]; then
       BR='master'
       SubInfo "Fast-forwarding '${PREV}' --> '${BR}' again"
       git_ff_merge "${BR}" "${PREV}"

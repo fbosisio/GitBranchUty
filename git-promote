@@ -96,6 +96,10 @@ function do_git_merge {
 
   SubInfo "Checking-out branch '${NEW_REV}'"
   ${RUN} git checkout "${NEW_REV}"
+  if [ $? -ne 0 ]; then
+    printf '\n\tFATAL: git checkout failed !!!\n\n' >&2
+    exit 6
+  fi
 
   #SubInfo "Re-running 'git pull' to make sure branch is aligned"
   #${RUN} git pull
@@ -298,6 +302,7 @@ if [ -s "${BRANCH_CONFIG_FAILURE_FILE}" ]; then
 fi
 MATCHED=${MATCHED% }
 LAST_BRANCH=${MATCHED##* }
+[ -z "${LAST_BRANCH}" ] && LAST_BRANCH="${START_BR}"
 NEXT_OF_LAST=$(read_branch_config "${LAST_BRANCH}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
                /bin/awk '/^[ \t]*NEXT/{ print $3 }');
 unset UPDATE_MASTER_BRANCH

@@ -8,6 +8,8 @@ my $rcs_id = q$Header: GitCmd.pm,v 1.7 2013/06/20 14:37:44 bosisio Exp $;
 
 use strict;
 use Carp;
+#use version (); our $VERSION = version->declare("v1.0");
+our $VERSION = "1.0";
 
 #------------------------------------------------------------------------------
 
@@ -144,9 +146,10 @@ sub Run {
 
   my $cmd = $command . ' ' . join(' ',@args);
   $cmd =~ s/\s+$//;
-  print STDERR '[',ref($self),"] About to run 'git $cmd' ...\n" if ( $self->{verbose} > 0 );
-  # If 'printOnly' option is set, use a "do-nothing" command instead of 'git'
-  $cmd = ( $self->{printOnly} ? 'cd .' : "$git_executable --no-pager $cmd" );
+  print STDERR '[',ref($self),"] About to run \"git $cmd\" ...\n" if ( $self->{verbose} > 0 );
+  # If 'printOnly' option is set, use a "do-nothing" command
+  $cmd = 'log -0' if ( $self->{printOnly} );
+  $cmd = "$git_executable --no-pager $cmd";
 
   $self->{_lastCmdFailed} = FALSE; # Reset state
 
@@ -300,12 +303,12 @@ For example:
 
 =head2 CHECKING RETURN CODE
 
-The B<OK> method can be used to test the result of last executed GIT command,
+The B<KO> method can be used to test the result of last executed GIT command,
 when the I<stopOnErrors> option is set to I<false>.
 
     my $git = new GitGmd( stopOnErrors => 0 ); # turn-off default
     $git->status();                            # no exception can occurr
-    if ( ! $git->OK ) { ... }                  # handle error, if any
+    if ( $git->KO ) { ... }                    # handle error, if any
 
 =head2 EXECUTING A COMMAND
 
@@ -362,7 +365,7 @@ The B<Close> method is used to close a file-descriptor given as second argument
 to I<Run> (or as first argument to any method mapping a git command via the
 autoload facility). Besides closing the given file descriptor, the return-code
 for the underlying git-command is checked and, in case of errors, either
-I<croak> is called or it is stored for subsequent inspection by the I<OK>
+I<croak> is called or it is stored for subsequent inspection by the I<KO>
 method (depending on the I<stopOnErrors> option).
 
     my $io_handle = new IO::Handle;

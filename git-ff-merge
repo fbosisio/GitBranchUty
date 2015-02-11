@@ -1,0 +1,52 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# This script is a (modified) perl re-writing of the shell script found at
+# http://stackoverflow.com/questions/4156957/merging-branches-without-checkout/4157435#4157435
+# whose purpouse is exactly to perform a fast-forward merge, without the need
+# to check-out the involved branches.
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use GitCmd;
+
+my $git = new GitCmd;
+
+my( $branch, $commit ) = @ARGV;
+
+my $head_sym_ref = $git->symbolic_ref( 'HEAD' );
+
+if ( $head_sym_ref eq "refs/heads/$branch" ) {
+  # If given "$branch" is the HEAD, perform a real "git merge" in order
+  # to update also the working tree (and not only the repository)
+  $git->merge( '--ff-only', $commit );
+} else {
+  my $branch_hash = $git->show_ref( '-s', '--verify', "'refs/heads/$branch'",
+                                    '2>/dev/null' );
+
+  my $commit_hash = $git->rev_parse( '--verify', '--quiet', $commit );
+
+  if ( $branch_hash eq $commit_hash ) {
+    print "Already up-to-date.\n";
+  } else {
+    my $head_sym_ref = $git->merge_base( $branch_hash, $commit_hash );
+    if ( $head_sym_ref ne $branch_hash ) {
+      die "Merging '$commit' into '$branch' would not be a fast-forward.\n";
+    }
+
+    my( $branch_short_hash ) = ( $branch_hash =~ /^(\w{7})/ );
+    my( $commit_short_hash ) = ( $commit_hash =~ /^(\w{7})/ );
+    print "Updating $branch_short_hash..$commit_short_hash\n";
+    $git->update_ref( '-m', "'Merge $commit: fast forward'",
+                      "'refs/heads/$branch'", $commit_hash, $branch_hash );
+
+    print "Fast forward\n";
+    my $safe_git = $git->new( stopOnErrors => FALSE );
+    $safe_git->diff( '--stat', "'$branch\@{1}'", "'$branch'" );
+    warn "WARNING: execution of 'git diff' failed.\n" if ( $safe_git->KO );
+  }
+}

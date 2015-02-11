@@ -1,0 +1,23 @@
+#!/bin/sh
+#------------------------------------------------------------------------------
+# Adapted from http://stackoverflow.com/questions/4950725/how-do-i-get-git-to-show-me-which-branches-are-tracking-what
+#------------------------------------------------------------------------------
+
+unset SHORT
+[ "$1" = '--short' ] && SHORT=1
+
+git --no-pager for-each-ref --format='%(refname:short)' refs/heads/* | \
+        while read BRANCH; do
+  UPSTREAM=$(git rev-parse --abbrev-ref ${BRANCH}@{upstream} 2>/dev/null)
+  if [ $? = 0 ]; then
+    if [ -z "${SHORT}" ]; then
+      printf '%s tracks %s\n' "${BRANCH}" "${UPSTREAM}"
+    else
+      printf '%s\n' "${BRANCH}"
+    fi
+  else
+    if [ -z "${SHORT}" ]; then
+      printf '%s has no upstream configured\n' "${BRANCH}"
+    fi
+  fi
+done

@@ -1,5 +1,7 @@
 #!/usr/local/bin/perl -w
 #------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
 # This script is a (modified) perl re-writing of the shell script found at
 # http://stackoverflow.com/questions/4156957/merging-branches-without-checkout/4157435#4157435
 # whose purpouse is exactly to perform a fast-forward merge, without the need

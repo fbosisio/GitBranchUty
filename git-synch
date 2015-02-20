@@ -1,0 +1,514 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use Getopt::Long;
+use IO::Handle;
+#use Data::Dumper;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use GitCmd;
+
+# Only default values different from FALSE must be listed here ...
+my %OPTIONS = (
+  fetch   => TRUE,
+  restore => TRUE,
+  pretty  => TRUE,
+  mode    => 'ask'
+);
+
+my %COLORS = (
+  I => '[33;40m ',
+  B => '[30;42m ',
+  N => ' [m'
+);
+
+my %STATUS = ();
+
+# Here $GIT_R (R for "real") ALWAYS invokes the various git commands,
+# whereas $GIT_D (D for "dryrun") obeys the "--dryrun" option (run or print).
+my $GIT_R = undef;
+my $GIT_D = undef;
+
+{ # -----[ main ]-----
+
+  &ManageOptions();
+
+  $GIT_R = new GitCmd( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  $GIT_D = $GIT_R->new( printOnly => $OPTIONS{dryrun} );
+
+  my $remote = undef;
+  my $branch = undef;
+  if ( $#ARGV >= 1 ) {
+    $remote = $ARGV[0];
+    $branch = $ARGV[1];
+  } elsif ( $#ARGV == 0 ) {
+    $STATUS{git_dir} = $GIT_R->rev_parse( '--git-dir' );
+    if ( -d "$STATUS{git_dir}/refs/remotes/$ARGV[0]" ) {
+      $remote = $ARGV[0];
+    } else {
+      $branch = $ARGV[0];
+    }
+  }
+
+  if ( $OPTIONS{all} && defined($branch) ) {
+    die "You cannot specify both '--all' and a branch name !\n ";
+  }
+
+  if ( $OPTIONS{fetch} ) {
+    &Info( 'Fetching remote repository' );
+    $GIT_R->fetch( $remote || '' );
+  }
+
+  if ( $OPTIONS{all} ) {
+    # Process all tracking branches
+    my @branch_list = &GitTrackingBranches( $remote );
+    foreach my $elem (@branch_list) {
+      my( $br, $rem ) = @{$elem};
+      &Info( "Checking branch $br" );
+      &SynchBranch( $br, $rem );
+    } # END foreach
+  } else {
+    # Process just a single branch
+    if ( ! defined($branch) ) {
+      $branch = $STATUS{orig_branch} = &CurrentGitBranch();
+    }
+    &SynchBranch( $branch, $remote );
+  }
+
+  # If $STATUS{active_branch} is defined, also $STATUS{orig_branch} is defined.
+  if ( exists($STATUS{active_branch}) &&
+       ( $STATUS{active_branch} ne $STATUS{orig_branch} ) ) {
+    if ( $OPTIONS{restore} || exists($STATUS{stash_saved}) ) {
+      &Info( "Running 'git checkout $STATUS{orig_branch}'" );
+      $GIT_D->checkout( $STATUS{orig_branch} );
+    } else {
+      print "Leaving repository on branch '$STATUS{active_branch}'\n",
+            "(run 'git checkout $STATUS{orig_branch}' to revert-back)\n";
+    }
+  }
+
+  if ( exists($STATUS{stash_saved}) ) {
+    &SubInfo( "Restoring work-in-progress saved with 'git stash'" );
+    $GIT_D->stash( 'pop' );
+  }
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub SynchBranch {
+  # ----- Function arguments -----
+  my( $branch, $remote ) = @_;
+  # ----- Function code -----
+  if ( ! defined($remote) ) {
+    $remote = $GIT_R->rev_parse( '--abbrev-ref', "$branch\@{upstream}",
+                                 '2>/dev/null' );
+  }
+
+  $STATUS{git_dir} = $GIT_R->rev_parse( '--git-dir' ) unless ( exists($STATUS{git_dir}) );
+  my $remote_ref = "refs/remotes/$remote";
+  $remote_ref = "refs/remotes/$remote/$branch" if ( -d "$STATUS{git_dir}/$remote_ref" );
+
+  my( $remote_name ) = ( $remote_ref =~ m!/([^/]+)/[^/]+$! );
+
+  my $max = 6;
+  my $count = 1;
+  for ( ; $count <= $max; ++$count ) {
+    my $local_br_hash = $GIT_R->show_ref( '-s', '--verify',
+                                          "'refs/heads/$branch'",
+                                          '2>/dev/null' );
+    my $remote_br_hash = $GIT_R->show_ref( '-s', '--verify', "'$remote_ref'",
+                                           '2>/dev/null' );
+    my $common_ancestor = $GIT_R->merge_base( $local_br_hash, $remote_br_hash );
+    print "\t\tmerge_base = $common_ancestor\n" if ( $OPTIONS{verbose} );
+
+    if ( $common_ancestor eq $remote_br_hash ) {
+      if ( $common_ancestor eq $local_br_hash ) {
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        # 1) LOCAL = COMMON = REMOTE                 common         #
+        #    (already "up-to-date")              local o remote     #
+        #                                              |            #
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        print "Already up-to-date.\n";
+        last;
+      } else {
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        # 2) LOCAL != COMMON = REMOTE          local o              #
+        #    (only a "push" is needed)                \             #
+        #                                       common o remote     #
+        #                                              |            #
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        last if &ModeOptionBlocksOper( 'push', 'push', $branch, 'pull' );
+        &SubInfo( "Pushing branch '$branch'" );
+        my $safe_dry_git  = $GIT_D->new( stopOnErrors => FALSE );
+        $safe_dry_git->push( $remote_name, $branch );
+        last unless ( $safe_dry_git->KO );
+        # Maybe someone else just pushed something in the meanwhile.
+        # So perform a "fetch" and then retry the whole alignment ...
+        &SubInfo( "Push failed: trying pull first" );
+        $GIT_R->fetch( $remote_name );
+        # Let the loop go on (it will be step 3 or 4)
+      }
+    } else { # --- ( $common_ancestor ne $remote_br_hash ) ---
+      if ( $common_ancestor eq $local_br_hash ) {
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        # 3) LOCAL = COMMON != REMOTE                    o remote   #
+        #   (only a "pull" is needed)                   /           #
+        #                                        local o common     #
+        #                                              |            #
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        last if &ModeOptionBlocksOper( 'pull', 'pull', $branch, 'push' );
+        &SubInfo( "Pulling branch '$branch' (via FF merge)" );
+        &GitFastForwardMerge( $branch, $remote, $local_br_hash,
+                              $remote_br_hash );
+        last;
+      } else {
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        # 4) LOCAL != COMMON != REMOTE         local o   o remote   #
+        #   (both "pull" and "push" needed)           \ /           #
+        #                                              o common     #
+        #                                              |            #
+        #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+        last if &ModeOptionBlocksOper( 'both pull and push', 'pull', $branch );
+        if ( &IsCheckoutNeeded($branch) ) {
+          $STATUS{active_branch} = $branch;
+          &SubInfo( "Running 'git checkout $branch'" );
+          $GIT_D->checkout( $branch );
+        }
+        # Here we only do the 'pull' step, then we re-enter the loop
+        # in order to perform the 'push' (it will be step 2 above)
+        &ExecuteGitPull( $branch, $remote, $local_br_hash, $remote_name,
+                         $common_ancestor );
+        # Since we still need to do the "push", we don't stop the loop ...
+        if ( $OPTIONS{dryrun} ) { # ... unless in 'dryrun' mode
+          print "Please note we cannot test the 'push' phase in dryrun mode.\n";
+          last;
+        }
+      }
+    }
+  } # END for
+  die "Maximum number of iterations ($max) reached!\n" if ( $count >= $max );
+}
+
+#==============================================================================
+
+sub ManageOptions {
+  # ----- Function code -----
+  &GetOptions( \%OPTIONS,
+               'verbose|v',
+               'dryrun|dry-run|n',
+               'pretty!',
+               'fetch!',
+               'restore!',
+               'rebase',
+               'author=s',
+               'mode=s',
+               'all',
+               'do-not-check-status', # Undocumented ....
+               'help|h|?' );
+  #print &Dumper( \%OPTIONS );
+
+  if ( $OPTIONS{help} ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    my $indent_space = ' ' x length($program_name);
+    print STDERR "
+  USAGE: $program_name [-v|--verbose] [-n|--dry-run|--dryrun] [--nopretty]
+         $indent_space [--nofetch] [--norestore] [--rebase] [--author=<author>]
+         $indent_space [--mode={check|pull|push|auto|ask}]
+         $indent_space [<remote>] [--all|<branch>]\n
+         --verbose    : print each underlying git command before execution
+         --dryrun     : just print git commands, but do not execute them
+         --nopretty   : do not use ANSI colors to highlight step messages
+         --nofetch    : skip 'git fetch' before starting 'push/pull'
+         --norestore  : do not revert back to original branch (if changed)
+         --rebase     : use rebase instead of merge when pulling
+         --author=<x> : use 'x' as author of the merge commit (if not ff)\n
+         --mode=check : just tell if push or pull are needed, but do nothing
+         --mode=pull  : pull without asking (but do not push)
+         --mode=push  : push without asking (also pull in case of conflicts)
+         --mode=auto  : do both pull and push as required, whithout asking
+         --mode=ask   : (default) do both pull and push, but with confirmation\n
+  If '<remote>' is omitted, it defaults to the tracked remote of '<branch>'.
+  If '<branch>' is omitted, it defaults to the current branch.
+  If '--all' is used, than all tracking branches (of <remote>) are synchronized.
+\n";
+    exit 0;
+  }
+
+  if ( $OPTIONS{mode} !~ /^(?:check|pull|push|auto|ask)$/ ) {
+    die "Value '$OPTIONS{mode}' not valid for '--mode':\n" .
+        "must be one of 'check', 'pull', 'push', 'auto' or 'ask' !\n ";
+  }
+
+  $COLORS{I} = $COLORS{B} = $COLORS{N} = '' unless ( $OPTIONS{pretty} );
+}
+
+#==============================================================================
+
+sub GitStatusIsClean {
+  # ----- Local variables -----
+  my @status = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $GIT_R->status( $fh, '--untracked-files=no' );
+    while ( my $line = <$fh> ) {
+      if ( $line =~ /nothing\s+to\s+commit/ ) { @status = (); last; }
+      push( @status, $line );
+    }
+  $GIT_R->Close( $fh );
+  # Print command-output (if status is clean, list is empty so print nothing)
+  foreach my $line (@status) { print $line; }
+  # ----- Return value -----
+  ( $#status < 0 );
+}
+
+#==============================================================================
+
+sub CurrentGitBranch {
+  # ----- Function code -----
+  my $current = $GIT_R->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#==============================================================================
+
+# The logic of this routine is based on the shell script found at:
+# http://stackoverflow.com/questions/4950725/how-do-i-get-git-to-show-me-which-branches-are-tracking-what
+sub GitTrackingBranches {
+  # ----- Function arguments -----
+  my( $remote ) = @_;
+  # ----- Local variables -----
+  my @list = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  my $safe_git = $GIT_R->new( stopOnErrors => FALSE );
+  $GIT_R->for_each_ref( $fh, "--format='%(refname:short)'", 'refs/heads/*' );
+    while ( my $br = <$fh> ) {
+      chomp( $br );
+      my $upstr = $safe_git->rev_parse( '--abbrev-ref', "$br\@{upstream}",
+                                        '2>/dev/null' );
+      next if ( $safe_git->KO );
+      next if ( defined($remote) && ( $upstr !~ m!^$remote/! ) );
+      push( @list, [ $br, $upstr ] );
+    }
+  $GIT_R->Close( $fh );
+  # ----- Return value -----
+  @list;
+}
+
+#==============================================================================
+
+# The logic of this routine is based on (part of) the shell script found at:
+# http://stackoverflow.com/questions/4156957/merging-branches-without-checkout/4157435#4157435
+sub GitFastForwardMerge {
+  # ----- Function arguments -----
+  my( $branch, $commit, $branch_hash, $commit_hash ) = @_;
+  # ----- Function code -----
+  $STATUS{orig_branch} = &CurrentGitBranch() unless ( exists($STATUS{orig_branch}) );
+  my $head_br = ( exists($STATUS{active_branch}) ? $STATUS{active_branch} : $STATUS{orig_branch} );
+
+  if ( $branch eq $head_br ) {
+    # If given "$branch" is the HEAD, perform a real "git merge" in order
+    # to update also the working tree (and not only the repository)
+    $GIT_D->merge( '--ff-only', $commit );
+  } else {
+    my( $branch_short_hash ) = ( $branch_hash =~ /^(\w{7})/ );
+    my( $commit_short_hash ) = ( $commit_hash =~ /^(\w{7})/ );
+    print "Updating $branch_short_hash..$commit_short_hash\n";
+    $GIT_D->update_ref( '-m', "'Merge $commit: fast forward'",
+                        "'refs/heads/$branch'", $commit_hash, $branch_hash );
+
+    print "Fast forward\n";
+    my $safe_dry_git = $GIT_D->new( stopOnErrors => FALSE );
+    $safe_dry_git->diff( '--stat', "'$branch\@{1}'", "'$branch'" );
+    warn "WARNING: execution of 'git diff' failed.\n" if ( $safe_dry_git->KO );
+  }
+}
+
+#==============================================================================
+
+sub Info {
+  print "\t$COLORS{I}@_ ...$COLORS{N}\n";
+}
+
+#==============================================================================
+
+sub SubInfo {
+  print "\t$COLORS{B}@_ ...$COLORS{N}\n";
+}
+
+#==============================================================================
+
+sub AskForConfirmation {
+  # ----- Function arguments -----
+  my( $msg ) = @_;
+  # ----- Function code -----
+  while ( TRUE ) {
+    printf '%s [Y/N] » ', $msg;
+    if ( $OPTIONS{dryrun} ) { print "Y [dryrun]\n"; return TRUE; }
+    chomp( my $answer = <STDIN> );
+    return TRUE  if ( $answer =~ /^y$/i );
+    return FALSE if ( $answer =~ /^n$/i );
+  } # END while
+}
+
+#==============================================================================
+
+sub ModeOptionBlocksOper {
+  # ----- Function arguments -----
+  my( $required_opers, $oper, $branch, $forbidden_mode ) = @_;
+  # ----- Local variables -----
+  my $stop = FALSE;
+  # ----- Function code -----
+  if ( $OPTIONS{mode} eq 'check' ) {
+    print "\t==> $required_opers required.\n";
+    $stop = TRUE;
+  } elsif ( $OPTIONS{mode} eq 'ask' ) {
+    my $ans = &AskForConfirmation( "[branch $branch] Proceed with $oper ?" );
+    $stop = ( ! $ans ); # Stop if answer is 'N'
+  } elsif ( defined($forbidden_mode) && ($OPTIONS{mode} eq $forbidden_mode) ) {
+    print "\t==> $oper skipped.\n";
+    $stop = TRUE;
+  }
+  # ----- Return value -----
+  $stop;
+}
+
+#==============================================================================
+
+sub IsCheckoutNeeded {
+  # ----- Function arguments -----
+  my( $branch ) = @_;
+  # ----- Local variables -----
+  my $checkout_needed;
+  # ----- Function code -----
+  if ( exists($STATUS{active_branch}) ) {
+    $checkout_needed = ( $STATUS{active_branch} ne $branch );
+  } else {
+    $STATUS{orig_branch} = &CurrentGitBranch() unless ( exists($STATUS{orig_branch}) );
+    $checkout_needed = ( $STATUS{orig_branch} ne $branch );
+    if ( $checkout_needed ) {
+      # First checkout ==> check 'git status' before continuing
+      &SubInfo( "Running 'git status'" );
+      if ( $OPTIONS{'do-not-check-status'} ) {
+        print "Warning: check of 'git status' skipped as requested !!!\n";
+      } elsif ( ! &GitStatusIsClean() ) {
+        my $msg = 'git status not clean: save current work and proceed ?';
+        my $ans = &AskForConfirmation( $msg );
+        exit 1 if ( ! $ans ); # Stop if answer is 'N'
+        &SubInfo( "Saving work-in-progress with 'git stash'" );
+        $GIT_D->stash( 'save' );
+        $STATUS{stash_saved} = TRUE;
+        # Re-check for enhanced safety ...
+        &SubInfo( "Checking 'git status' again" );
+        die "git status is not clean after git stash!\n" unless ( &GitStatusIsClean() );
+      }
+    }
+  }
+  # ----- Return value -----
+  $checkout_needed;
+}
+
+#==============================================================================
+
+sub GitGetCommitParents {
+  # ----- Function arguments -----
+  my( $commit ) = @_;
+  # ----- Local variables -----
+  my @parents = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $GIT_R->cat_file( $fh, '-p', $commit );
+    while ( my $line = <$fh> ) {
+      push( @parents, $1 ) if ( $line =~ /^parent\s+(\w+)\s*$/ );
+    }
+  $GIT_R->Close( $fh );
+  # ----- Return value -----
+  @parents;
+}
+
+#==============================================================================
+
+sub CommitRangeIncludesAMerge {
+  # ----- Function arguments -----
+  my( $start_commit, $end_commit ) = @_;
+  # ----- Function code -----
+  # Go backward from "end-commit", until "start-commit" is reached
+  # (or a merge-commit is encountered)
+  my $commit = $end_commit;
+  while ( $commit ne $start_commit ) {
+    my @parents = &GitGetCommitParents( $commit );
+    return TRUE if ( $#parents > 1 ); # Merge-commit --> we can stop search
+    $commit = $parents[0];
+  } # END while
+  # ----- Return value -----
+  FALSE; # No merge-commit found
+}
+
+#==============================================================================
+
+sub GetGitFetchUrl {
+  # ----- Function arguments -----
+  my( $remote ) = @_;
+  # ----- Local variables -----
+  my $fetch_addr;
+  # ----- Function code -----
+  &SubInfo( "Running 'git remote' to get repo URL" );
+  my $fh = new IO::Handle;
+  $GIT_R->remote( $fh, '-v' );
+    while ( my $line = <$fh> ) {
+      if ( $line =~ /^$remote\s.*\@([^.]+)\..*\(fetch\)/ ) {
+        $fetch_addr = $1;
+        last;
+      }
+    }
+  $GIT_R->Close( $fh );
+  # ----- Return value -----
+  $fetch_addr;
+}
+
+#==============================================================================
+
+sub ExecuteGitPull {
+  # ----- Function arguments -----
+  my( $branch_name, $remote, $br_hash, $remote_name, $ancestor_hash ) = @_;
+  # ----- Function code -----
+  my $use_rebase = $OPTIONS{rebase};
+  if ( $use_rebase && &CommitRangeIncludesAMerge($ancestor_hash,$br_hash) ) {
+    # It seems better not to rebase a merge-commit ...
+    # ... or can we use 'git rebase -p' to preserve merges ???
+    print "Option '--rebase' ignored since '$branch_name' includes a merge.\n";
+    $use_rebase = FALSE;
+  }
+
+  my @opts = ( '--pretty' );
+  push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
+  push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+
+  if ( $use_rebase ) {
+    &SubInfo( "Running 'git pull --rebase'" );
+    $GIT_D->pull( '--rebase' );
+#    &SubInfo( "Running 'git do-rebase'" );
+#    # Here we use "$GIT_R" since we also pass "--dryrun" option (if present)
+#    $GIT_R->do_rebase( @opts, '-p', $remote );
+  } else {
+    push( @opts, "--author='$OPTIONS{author}'" ) if ( $OPTIONS{author} );
+    $STATUS{fetch_host} = &GetGitFetchUrl( $remote_name ) unless ( exists($STATUS{fetch_host}) );
+    my $msg ="Merge $remote ($STATUS{fetch_host}) into $branch_name";
+    &SubInfo( "Running 'git do-merge'" );
+    # Here we use "$GIT_R" since we also pass "--dryrun" option (if present)
+    $GIT_R->do_merge( @opts, '-m', "'$msg'", $remote );
+  }
+}
+
+#==============================================================================

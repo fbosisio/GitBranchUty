@@ -1,0 +1,234 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use Getopt::Long;
+#use Data::Dumper;
+
+# Only default values different from FALSE must be listed here ...
+my %OPTIONS = (
+  pretty   => TRUE,
+  fetch    => TRUE,
+  interact => TRUE,
+  restore  => TRUE
+);
+
+my %COLORS = (
+  I => '[33;40m ',
+  B => '[30;41m ',
+  N => ' [m'
+);
+
+{ # -----[ main ]-----
+
+  &ManageOptions();
+  die "You must specify at least one branch !\n" if ( $#ARGV < 0 );
+
+  # Here $git_r (R for "real") ALWAYS invokes the various git commands,
+  # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
+  my $git_r = new GitSeqMerge( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
+
+  my $start = $git_r->CurrentBranch;
+  # If first branch is the current one, skip it (since implicitly considered)
+  shift if ( $ARGV[0] eq $start );
+  die "You cannot specify just current branch !\n" if ( $#ARGV < 0 );
+
+  &Info( 'Checking "git status" [this may take a while]' );
+  my $starting_clean = $git_r->StatusIsClean;
+  unless ( $starting_clean ) {
+    &SubInfo( 'Stashing local changes' );
+    $git_d->stash( 'save' );
+    &SubInfo( 'Checking "git status" again (for safety)' );
+    die "git status is not clean after git stash!\n" if ( !$git_d->StatusIsClean );
+  }
+
+  if ( $OPTIONS{fetch} ) {
+    &Info( 'Fetching remote repository' );
+    $git_r->fetch;
+  }
+
+  # Options for both "git synch" and "git do-merge"
+  my @synch_opts = ();
+  push( @synch_opts, '--verbose' ) if ( $OPTIONS{verbose} );
+  push( @synch_opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+  push( @synch_opts, "--author='$OPTIONS{author}'" ) if ( $OPTIONS{author} );
+
+  # Options for "git do-merge" only
+  my @doMerge_opts = @synch_opts;
+  push( @doMerge_opts, '--pretty' ) if ( $OPTIONS{pretty} );
+  push( @doMerge_opts, '--nointeract' ) unless ( $OPTIONS{interact} );
+  push( @doMerge_opts, '--edit' ) if ( $OPTIONS{edit} );
+  push( @doMerge_opts, "--run='$OPTIONS{run}'" ) if ( $OPTIONS{run} );
+
+  # Options for "git synch" only
+  push( @synch_opts, '--nopretty' ) unless ( $OPTIONS{pretty} );
+  push( @synch_opts, ('--nofetch', '--rebase', '--do-not-check-status') );
+
+  &SubInfo( 'Pulling all selected branches' );
+  $git_r->synch( @synch_opts, '--mode=pull',
+                 $start, @ARGV ); # $git_r --dryrun(?)
+
+  my $prev = $start;
+  for ( my $i=0; $i<=$#ARGV; ++$i ) {
+    my $branch = $ARGV[$i];
+    &Info( "Checking out branch '$branch'" );
+    $git_d->checkout( $branch );
+
+    my $flags = '';
+    if ( $OPTIONS{'last-merge-opts'} && ( $i == $#ARGV ) ) {
+      my $last_opts = $OPTIONS{'last-merge-opts'};
+      $flags = " ($last_opts)";
+      push( @doMerge_opts, "'$last_opts'" );
+    }
+
+    &Info( "Merging$flags '$prev' -> '$branch'" );
+    my $msg = "Merged$flags $prev into $branch";
+    $msg .= " ($OPTIONS{message})" if ( $OPTIONS{message} );
+    $git_r->do_merge( @doMerge_opts, '-m', "'$msg'", $prev ); # $git_r --dryrun(?)
+
+    $prev = $branch;
+  } # END for
+
+  &Info( 'Pushing all selected branches' );
+  $git_r->synch( @synch_opts, '--norestore', '--mode=push',
+                 $start, @ARGV ); # $git_r --dryrun(?)
+
+  if ( $OPTIONS{restore} or !$starting_clean ) {
+    &Info( "Reverting back to original branch ($start)" );
+    $git_d->checkout( $start );
+  } elsif ( $git_r->CurrentBranch ne $start ) {
+    print "WARNING: run 'git checkout $start' to go back to original branch!\n";
+  }
+
+  unless ( $starting_clean ) {
+    &SubInfo( 'Restoring stashed changes' );
+    $git_d->stash( 'pop' );
+  }
+
+  &Info( 'Showing "remote synch status" of selected branches (to verify)' );
+  $git_r->synch( @synch_opts, '--mode=check', $start, @ARGV ); # $git_r --dryrun(?)
+
+  print "\n\tMerge sequence succesfully completed.\n\n";
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub ManageOptions {
+  # ----- Function code -----
+  &GetOptions( \%OPTIONS,
+               'verbose|v',
+               'dryrun|dry-run|n',
+               'pretty!',
+               'fetch!',
+               'interact!',
+               'restore!',
+               'edit|e',
+               'run=s',
+               'message|m=s',
+               'author=s',
+               'last-merge-opts=s',
+               'help|h|?' ) or die "ERROR: option parsing failed!\n";
+  #print &Dumper( \%OPTIONS );
+
+  if ( $OPTIONS{help} ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    my $indent_space = ' ' x length($program_name);
+    print STDERR "
+  USAGE: $program_name [-v|--verbose] [-n|--dry[-]run] [--no[-]pretty]
+         $indent_space [--no[-]interact] [--no[-]restore] [-e|--edit]
+         $indent_space [--run=<command>] [-m <msg>|--message=<msg>]
+         $indent_space [--author=<author>] <branch-list>\n
+         --verbose    : print each underlying git command before execution
+         --dryrun     : just print git commands, but do not execute them
+         --nopretty   : do not use ANSI colors to highlight step messages
+         --nointeract : avoid asking confirmations (assume everything OK)
+         --norestore  : do not revert back to original branch (if changed)
+         --edit       : force editing of files with conflicts after merge
+                        (normally this only happens if 'mergetool' fails)
+         --run=<cmd>  : execute 'cmd' before committing each merge step
+                        (if 'cmd' exits non-zero, the merge is aborted)
+         --message    : use <msg> as comment for merge commits
+         --author=<x> : use 'x' as author of the merge commits\n
+         Each branch listed is checked-out and merged with previous one, then
+         all branches are pushed (pulling if needed) and original one restored.
+\n";
+    exit 0;
+  }
+
+  $COLORS{I} = $COLORS{B} = $COLORS{N} = '' unless ( $OPTIONS{pretty} );
+}
+
+#==============================================================================
+
+sub Info {
+  print "\n\t$COLORS{B}@_ ...$COLORS{N}\n\n";
+}
+
+#==============================================================================
+
+sub SubInfo {
+  print "\t$COLORS{I}@_ ...$COLORS{N}\n";
+}
+
+#==============================================================================
+#==============================================================================
+
+package GitSeqMerge;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub StatusIsClean {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Local variables -----
+  my @status = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $self->status( $fh, '--untracked-files=no' );
+    while ( my $line = <$fh> ) {
+      if ( $line =~ /nothing\s+to\s+commit/ ) { @status = (); last; }
+      push( @status, $line );
+    }
+  $self->Close( $fh );
+  # Print command-output (if status is clean, list is empty so print nothing)
+  foreach my $line (@status) { print $line; }
+  # ----- Return value -----
+  ( $#status < 0 );
+}
+
+#------------------------------------------------------------------------------
+
+sub CurrentBranch {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
+#==============================================================================

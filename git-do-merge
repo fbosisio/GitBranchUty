@@ -9,11 +9,7 @@ use constant TRUE  => (1 == 1);
 use constant FALSE => (! TRUE);
 
 use Getopt::Long;
-use IO::Handle;
 #use Data::Dumper;
-
-use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
-use GitCmd;
 
 # Only default values different from FALSE must be listed here ...
 my %OPTIONS = ( interact => TRUE );
@@ -34,11 +30,11 @@ my %COLORS = (
   # Here $git_r (R for "real") ALWAYS invokes the various git commands,
   # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
   # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
-  my $git_r = new GitCmd( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  my $git_r = new GitDoMerge( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
   my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
   my $git_s = $git_d->new( stopOnErrors => FALSE );
 
-  my $curr_br = &CurrentBranch( $git_r );
+  my $curr_br = $git_r->CurrentBranch;
 
   my $ask_before_commit = FALSE;
   my $abort_merge = FALSE;
@@ -49,6 +45,16 @@ my %COLORS = (
   if ( $git_s->KO ) {
     $ask_before_commit = TRUE;
     $abort_merge = &ResolveConflicts( $git_r, $git_d, $git_s );
+  }
+
+  if ( ( ! $abort_merge ) && exists($OPTIONS{run}) ) {
+    my $command = $OPTIONS{run};
+    &Info( "Running '$command' to validate the merge" );
+    $command = "echo '$command'" if ( $OPTIONS{dryrun});
+    system( $command ) == 0 or do {
+      print "Execution of '$command' failed: aborting.\n";
+      $ask_before_commit = $abort_merge = TRUE;
+    }
   }
 
   if ( $ask_before_commit ) {
@@ -67,13 +73,13 @@ my %COLORS = (
 
   &Info( "Running 'git commit' to conclude merge" );
   my @commit_opts = ();
-  if ( defined($OPTIONS{message}) ) {
+  if ( exists($OPTIONS{message}) ) {
     push( @commit_opts, ('-m', "'$OPTIONS{message}'") );
   } elsif ( ! $OPTIONS{interact} ) {
     push( @commit_opts, ('-m', "'Merged $br_to_merge into $curr_br'") );
   }
-  if ( defined($OPTIONS{author}) ) {
-    push( @commit_opts, ('--author', "'$OPTIONS{author}'") );
+  if ( exists($OPTIONS{author}) ) {
+    push( @commit_opts, "--author='$OPTIONS{author}'" );
   }
   $git_d->commit( @commit_opts );
 
@@ -92,7 +98,7 @@ sub ResolveConflicts {
 
   my $edit_files = $git_s->KO || $OPTIONS{edit};
 
-  my( $output, $merged, $conflicts ) = &ParseGitStatus( $git_r );
+  my( $output, $merged, $conflicts ) = $git_r->ParseGitStatus;
 
   if ( ! $edit_files ) {
     &Info( "Showing 'git status'" );
@@ -108,13 +114,14 @@ sub ResolveConflicts {
     my $editor = $git_r->var( 'GIT_EDITOR' );
     $editor = "echo $editor" if ( $OPTIONS{dryrun} );
     foreach my $file (@{$conflicts}) {
+print "About to run '$editor $file' ...\n";
       system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
     } # END foreach
 
     my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
     $git_d->add( @{$conflicts} ) if ( $ans );
 
-    ( $output, $merged, $conflicts ) = &ParseGitStatus( $git_d );
+    ( $output, $merged, $conflicts ) = $git_d->ParseGitStatus;
   }
 
   if ( defined($output) ) {
@@ -165,6 +172,7 @@ sub ManageOptions {
                'pretty',
                'interact!',
                'edit|e',
+               'run=s',
                'message|m=s',
                'author=s',
                'help|h|?' );
@@ -175,8 +183,8 @@ sub ManageOptions {
     $program_name =~ s/^(git)-/$1 /;
     my $indent_space = ' ' x length($program_name);
     print STDERR "
-  USAGE: $program_name [-v|--verbose] [-n|--dryrun|--dry-run] [--pretty]
-         $indent_space [--nointeract] [-e|--edit] [-m <msg>|--message=<msg>]
+  USAGE: $program_name [-v|--verbose] [-n|--dry[-]run] [--pretty] [--nointeract]
+         $indent_space [-e|--edit] [--run=<command>] [-m <msg>|--message=<msg>]
          $indent_space [--author=<name>] [<git-merge-options>] <branch-to-merge>\n
          --verbose    : print each underlying git command before execution
          --dryrun     : just print git commands, but do not execute them
@@ -184,6 +192,7 @@ sub ManageOptions {
          --nointeract : avoid asking confirmations (assume everything OK)
          --edit       : force editing of files with conflicts after merge
                         (normally this only happens if 'mergetool' fails)
+         --run=<cmd>  : run 'cmd' before committing the merge (abort if fails)
          --message    : use <msg> as comment for merge commit (if not ff)
          --author     : use <name> as author of the merge commit (if not ff)\n
          All other options are passed along to 'git merge'.\n\n";
@@ -203,40 +212,6 @@ sub ManageOptions {
   } # END foreach
 
   die "No <branch-to-merge> specified!\n" unless ( $branch_found );
-}
-
-#==============================================================================
-
-sub CurrentBranch {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Function code -----
-  my $current = $git->symbolic_ref( 'HEAD' );
-  $current =~ s!^refs/heads/!!;
-  # ----- Return value -----
-  $current;
-}
-
-#==============================================================================
-
-sub ParseGitStatus {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Local variables -----
-  my $output = ();
-  my @merged = ();
-  my @conflicts = ();
-  my $fh = new IO::Handle;
-  # ----- Function code -----
-  $git->status( $fh, '--untracked-files=no' );
-  while ( my $line = <$fh> ) {
-    $output .= $line;
-    push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
-    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
-  }
-  $git->Close( $fh );
-  # ----- Return value -----
-  ( $output, \@merged, \@conflicts );
 }
 
 #==============================================================================
@@ -264,4 +239,57 @@ sub AskConfirmation {
   } # END while
 }
 
+#==============================================================================
+#==============================================================================
+
+package GitDoMerge;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub CurrentBranch {
+  # ----- Local variables -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#------------------------------------------------------------------------------
+
+sub ParseGitStatus {
+  # ----- Local variables -----
+  my( $self ) = @_;
+  # ----- Local variables -----
+  my $output = ();
+  my @merged = ();
+  my @conflicts = ();
+  my $fh = new IO::Handle;
+  # ----- Function code -----
+  $self->status( $fh, '--untracked-files=no' );
+  while ( my $line = <$fh> ) {
+    $output .= $line;
+    push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
+    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
+  }
+  $self->Close( $fh );
+  # ----- Return value -----
+  ( $output, \@merged, \@conflicts );
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
 #==============================================================================

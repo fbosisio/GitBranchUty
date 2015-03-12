@@ -36,6 +36,7 @@ sub new {
   my $self = { verbose        => 0,
                stopOnErrors   => TRUE,
                chompScalars   => TRUE,
+               chompArrays    => TRUE,
                printOnly      => FALSE,
                _lastCmdFailed => FALSE,
                _openHandles   => {} };
@@ -70,8 +71,8 @@ sub Options {
     }
   } # END foreach
 
-  # The 'printOnly' option implies the 'verbose' one
-  $self->{verbose} = 1 if ( $self->{printOnly} && ($self->{verbose} <= 0) );
+#  # The 'printOnly' option implies the 'verbose' one
+#  $self->{verbose} = 1 if ( $self->{printOnly} && ($self->{verbose} <= 0) );
 
   # Evaluate the proper return-value, if requested
   if ( defined wantarray ) { # Non-void context
@@ -99,7 +100,10 @@ sub KO {
 sub ReturnListOrString {
   my( $self, $array_ref ) = @_;
 
-  return @{$array_ref} if ( wantarray ); # Return list
+  if ( wantarray ) {
+    chomp( @{$array_ref} ) if ( $self->{chompArrays} );
+    return @{$array_ref}; # Return list
+  }
 
   my $str = join( '', @{$array_ref} );
   chomp( $str ) if ( $self->{chompScalars} );
@@ -123,9 +127,15 @@ my $CloseFailed = sub {
   my( $self, $git_cmd ) = @_;
 
   if ( $self->{stopOnErrors} ) {
-    my $msg = ( $! ? "Failure in 'git $git_cmd': $!" :
-                     "Exit code from 'git $git_cmd' is $?" );
-
+    my $msg = "Failure in 'git $git_cmd': $!";
+    if ( ! $! ) {
+      my $ret  = $? >> 8;
+      my $sig  = $? & 127;
+      my $core = $? & 128;
+      $msg = "Exit code from 'git $git_cmd' is $ret";
+      $msg .= " (killed by SIG $sig)" if ( $sig > 0 );
+      $msg .= " - core dumped" if ( $core > 0 );
+    }
     &croak( "$msg\n" );
   }
   $self->{_lastCmdFailed} = TRUE;
@@ -146,7 +156,7 @@ sub Run {
 
   my $cmd = $command . ' ' . join(' ',@args);
   $cmd =~ s/\s+$//;
-  print STDERR '[',ref($self),"] About to run \"git $cmd\" ...\n" if ( $self->{verbose} > 0 );
+  print STDERR '[',ref($self),"] About to run \"git $cmd\" ...\n" if ( $self->{verbose} > 0 or $self->{printOnly} );
   # If 'printOnly' option is set, use a "do-nothing" command
   $cmd = 'log -0' if ( $self->{printOnly} );
   $cmd = "$git_executable --no-pager $cmd";
@@ -157,7 +167,7 @@ sub Run {
     open( $fh, "$cmd |" ) or $self->$OpenFailed( $command );
     $self->{_openHandles}->{$fh} = $command;
   } elsif ( ! defined wantarray ) { # Void context: leave output on STDOUT
-    system( $cmd ) == 0 or $self->$OpenFailed( $command );
+    system( $cmd ) == 0 or $self->$CloseFailed( $command );
   } else { # Scalar or list context: run command and save output
     local *GIT_CMD;
     my @output = ();

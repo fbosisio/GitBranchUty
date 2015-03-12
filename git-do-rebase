@@ -40,7 +40,7 @@ my %COLORS = (
 
   my $curr_br = &CurrentBranch( $git_r );
 
-  &Info( "Merging branch '$br_to_rebase' into '$curr_br'" );
+  &Info( "Rebasing branch '$curr_br' on top of '$br_to_rebase'" );
   $git_s->rebase( $br_to_rebase, @rebase_opts );
   while ( $git_s->KO ) {
     my $abort_rebase = &ResolveConflicts( $git_r, $git_d, $git_s );

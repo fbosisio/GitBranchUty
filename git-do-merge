@@ -36,7 +36,7 @@ my %COLORS = (
 
   my $curr_br = $git_r->CurrentBranch;
 
-  my $ask_before_commit = FALSE;
+  my $ask_before_commit = $OPTIONS{confirm};
   my $abort_merge = FALSE;
 
   &Info( "Merging branch '$br_to_merge' into '$curr_br'" );
@@ -44,17 +44,34 @@ my %COLORS = (
 
   if ( $git_s->KO ) {
     $ask_before_commit = TRUE;
-    $abort_merge = &ResolveConflicts( $git_r, $git_d, $git_s );
+    if ( $OPTIONS{'fail-if-conflict'} ) {
+      $abort_merge = TRUE;
+      $OPTIONS{interact} = FALSE; # Disable interaction, to force aborting
+    } else {
+      $abort_merge = &ResolveConflicts( $git_r, $git_d, $git_s );
+    }
+  }
+
+  # If there was nothing to merge, we are done
+  unless ( $git_r->MergeInProgress || $OPTIONS{dryrun} ) {
+    print "No file needs merging: job done.\n";
+    exit 0;
   }
 
   if ( ( ! $abort_merge ) && exists($OPTIONS{run}) ) {
     my $command = $OPTIONS{run};
     &Info( "Running '$command' to validate the merge" );
-    $command = "echo '$command'" if ( $OPTIONS{dryrun});
+    $command = "echo '$command'" if ( $OPTIONS{dryrun} );
     system( $command ) == 0 or do {
       print "Execution of '$command' failed: aborting.\n";
       $ask_before_commit = $abort_merge = TRUE;
     }
+  }
+
+  if ( $OPTIONS{'auto-undo'} ) {
+    &Info( 'Automatically undoing merge as requested' );
+    $git_d->merge( '--abort' );
+    exit 0;
   }
 
   if ( $ask_before_commit ) {
@@ -114,7 +131,7 @@ sub ResolveConflicts {
     my $editor = $git_r->var( 'GIT_EDITOR' );
     $editor = "echo $editor" if ( $OPTIONS{dryrun} );
     foreach my $file (@{$conflicts}) {
-print "About to run '$editor $file' ...\n";
+      print "Opening editor ('$editor') on '$file' as requested ...\n";
       system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
     } # END foreach
 
@@ -129,7 +146,7 @@ print "About to run '$editor $file' ...\n";
     print $output;
   }
   if ( $#{$conflicts} >= 0 ) {
-    print "\nThere are still unresolved conflicts! Abort forced.\n";
+    print "\nThere still are unresolved conflicts! Abort forced.\n";
     $abort_merge = TRUE;
   }
   # ----- Return value -----
@@ -173,6 +190,9 @@ sub ManageOptions {
                'interact!',
                'edit|e',
                'run=s',
+               'confirm',
+               'auto-undo',
+               'fail-if-conflict',
                'message|m=s',
                'author=s',
                'help|h|?' );
@@ -184,7 +204,8 @@ sub ManageOptions {
     my $indent_space = ' ' x length($program_name);
     print STDERR "
   USAGE: $program_name [-v|--verbose] [-n|--dry[-]run] [--pretty] [--nointeract]
-         $indent_space [-e|--edit] [--run=<command>] [-m <msg>|--message=<msg>]
+         $indent_space [-e|--edit] [--run=<command>] [--confirm] [--auto-undo]
+         $indent_space [--fail-if-conflict] [-m <msg>|--message=<msg>]
          $indent_space [--author=<name>] [<git-merge-options>] <branch-to-merge>\n
          --verbose    : print each underlying git command before execution
          --dryrun     : just print git commands, but do not execute them
@@ -193,6 +214,11 @@ sub ManageOptions {
          --edit       : force editing of files with conflicts after merge
                         (normally this only happens if 'mergetool' fails)
          --run=<cmd>  : run 'cmd' before committing the merge (abort if fails)
+         --confirm    : ask confirmation before committing the merge
+                        (normally this is only done in case of conflicts)
+         --auto-undo  : do the merge and then undo (test conflicts resolution)
+         --fail-if-conflict : undo merge if manual conflict resolution needed
+                              (use along with --nointeract for batch invocation)
          --message    : use <msg> as comment for merge commit (if not ff)
          --author     : use <name> as author of the merge commit (if not ff)\n
          All other options are passed along to 'git merge'.\n\n";
@@ -276,14 +302,26 @@ sub ParseGitStatus {
   my $fh = new IO::Handle;
   # ----- Function code -----
   $self->status( $fh, '--untracked-files=no' );
-  while ( my $line = <$fh> ) {
-    $output .= $line;
-    push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
-    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
-  }
+    while ( my $line = <$fh> ) {
+      $output .= $line;
+      push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
+      push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
+    }
   $self->Close( $fh );
   # ----- Return value -----
   ( $output, \@merged, \@conflicts );
+}
+
+#------------------------------------------------------------------------------
+
+sub MergeInProgress {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $git_dir = $self->rev_parse( '--git-dir' );
+  # ----- Return value -----
+#.git/CHERRY_PICK_HEAD
+  -f "$git_dir/MERGE_HEAD";
 }
 
 #------------------------------------------------------------------------------

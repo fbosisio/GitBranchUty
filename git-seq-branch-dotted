@@ -1,0 +1,67 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+my $PREFIX = '';
+
+{ # -----[ main ]-----
+
+  my $start_br = $ARGV[0];
+  if ( defined($start_br) && ( $start_br =~ /^--prefix=(.*)$/ ) ) {
+    $PREFIX = $1;
+    $start_br = $ARGV[1];
+  }
+
+  unless ( defined($start_br) ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    die "\nUSAGE: $program_name [--prefix=<pref>] <branch>\n\n";
+  }
+
+  my @branches = ();
+  open( my $fh, 'git --no-pager branch -r |' ) or
+                die "Can't run 'git branch': $!\n";
+    while ( my $line = <$fh> ) {
+      chomp( $line );
+      push( @branches, $line ) if ( $line =~ s!^.*/($PREFIX)!$1!o );
+    } # END while
+  close( $fh );
+
+  my @sorted = sort Sorter @branches;
+
+  my $show = FALSE;
+  foreach my $br (@sorted) {
+    $show = TRUE if ( $br eq $start_br );
+    print "$br\n" if ( $show );
+  } # END foreach
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+# N.B.: it uses global vars "$a" and "$b", as any sorting routine
+sub Sorter {
+  # ----- Local variables -----
+  my $one = $a;
+  my $two = $b;
+  # ----- Function code -----
+  $one =~ s/^$PREFIX//;
+  $two =~ s/^$PREFIX//;
+  my @x = split( /\./, $one );
+  my @y = split( /\./, $two );
+  my $N = $#x;
+  foreach my $i (0..$N) {
+    my $ret = ( $x[$i] <=> $y[$i] );
+    return $ret if ( $ret != 0 );
+  };
+  # ----- Return value -----
+  0;
+}
+
+#==============================================================================

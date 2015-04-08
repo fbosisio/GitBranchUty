@@ -1,0 +1,69 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+#use Getopt::Long;
+use IO::Handle;
+#use Data::Dumper;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use GitCmd;
+
+{ # -----[ main ]-----
+
+  my $start_br = $ARGV[0];
+  unless ( defined($start_br) ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    die "\nUSAGE: $program_name <branch>\n\n";
+  }
+
+  my $git = new GitCmd;
+
+  # Get remote-tracking branch for given branch
+  my $remote = $git->rev_parse( '--abbrev-ref', "$start_br\@{upstream}",
+                                '2>/dev/null' );
+  $remote =~ s!/$start_br$!!; # Extract the name of the remote
+
+  my $br = $start_br;
+  while ( $br ne 'master' ) {
+    $br = &ReadNextFromBranchConfig( $git, $br, $remote );
+    last if ( $br eq 'none' );
+    print "$br\n";
+  } # END while
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub ReadNextFromBranchConfig {
+  # ----- Function arguments -----
+  my( $git, $branch, $remote ) = @_;
+  # ----- Local variables -----
+  my $curr;
+  my $next;
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $git->show( $fh, "remotes/$remote/$branch:branch.config" );
+    while ( my $line = <$fh> ) {
+      if ( $line =~ /^\s*CURRENT\s*=\s*(\S+)/ ) { $curr = $1; }
+      elsif ( $line =~ /^\s*NEXT\s*=\s*(\S+)/ ) { $next = $1; }
+    }
+  $git->Close( $fh );
+
+  unless ( defined($next) && defined($curr) && ( $curr eq $branch ) ) {
+    die "ERROR: invaid 'branch.config' for branch '$branch' !\n";
+  }
+
+  $next = 'none' if ( $next eq $branch ); # Avoid recursion ...
+  # ----- Return value -----
+  $next;
+}
+
+#==============================================================================

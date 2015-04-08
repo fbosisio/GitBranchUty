@@ -9,7 +9,6 @@ use constant TRUE  => (1 == 1);
 use constant FALSE => (! TRUE);
 
 use Getopt::Long;
-use IO::Handle;
 #use Data::Dumper;
 
 use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
@@ -62,8 +61,7 @@ my $GIT_D = undef;
   }
 
   if ( $OPTIONS{fetch} ) {
-    &Info( 'Fetching remote repository' );
-    $GIT_R->fetch( $remote || '' );
+    &RunGitFetch( $remote || '', TRUE );
   }
 
   if ( $OPTIONS{all} ) { # Process all remote tracking branches
@@ -151,7 +149,7 @@ sub SynchBranch {
         # Maybe someone else just pushed something in the meanwhile.
         # So perform a "fetch" and then retry the whole alignment ...
         &SubInfo( "Push failed: trying pull first" );
-        $GIT_R->fetch( $remote_name );
+        &RunGitFetch( $remote_name, FALSE );
         # Let the loop go on (it will be step 3 or 4)
       }
     } else { # --- ( $common_ancestor ne $remote_br_hash ) ---
@@ -165,8 +163,10 @@ sub SynchBranch {
         last if &ModeOptionBlocksOper( 'pull', 'pull', $branch, 'push' );
         &SubInfo( "Pulling branch '$branch' (via FF merge)" );
         $STATUS{orig_branch} = $GIT_R->CurrentBranch unless ( exists($STATUS{orig_branch}) );
+        my $head_br = ( exists($STATUS{active_branch}) ?
+                        $STATUS{active_branch} : $STATUS{orig_branch} );
         $GIT_D->FastForwardMerge( $branch, $remote, $local_br_hash,
-                                  $remote_br_hash );
+                                  $remote_br_hash, $head_br );
         last;
       } else {
         #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
@@ -243,8 +243,8 @@ sub ManageOptions {
                'fetch!',
                'restore!',
                'rebase',
-               'author=s',
                'stash',
+               'author=s',
                'mode=s',
                'all',
                'ignore-config',
@@ -361,7 +361,7 @@ sub ModeOptionBlocksOper {
     my $ans = &AskForConfirmation( "[branch $branch] Proceed with $oper ?" );
     $stop = ( ! $ans ); # Stop if answer is 'N'
   } elsif ( defined($forbidden_mode) && ($selected_mode eq $forbidden_mode) ) {
-    print "\t==> $oper skipped.\n";
+    print "\t==> $oper skipped (since mode=$selected_mode).\n";
     $stop = TRUE;
   }
   # ----- Return value -----
@@ -444,6 +444,22 @@ sub ExecuteGitPull {
 }
 
 #==============================================================================
+
+sub RunGitFetch {
+  # ----- Function arguments -----
+  my( $remote, $print ) = @_;
+  # ----- Function code -----
+  if ( ( $OPTIONS{mode} ne 'check' ) && ( $^O eq 'msys' ) ) { # Only on WIN
+    # Apparently, it seems that sometimes this command has problems when
+    # run automatically instead of explicitly ... (but only on this OS)
+    &Info( 'Compacting repository (if needed)' ) if ( $print );
+    $GIT_R->gc( '--auto' );
+  }
+  &Info( 'Fetching remote repository' ) if ( $print );
+  $GIT_R->fetch( $remote );
+}
+
+#==============================================================================
 #==============================================================================
 
 package GitSynch;
@@ -520,10 +536,8 @@ sub TrackingBranches {
 # http://stackoverflow.com/questions/4156957/merging-branches-without-checkout/4157435#4157435
 sub FastForwardMerge {
   # ----- Function arguments -----
-  my( $self, $branch, $commit, $branch_hash, $commit_hash ) = @_;
+  my( $self, $branch, $commit, $branch_hash, $commit_hash, $head_br ) = @_;
   # ----- Function code -----
-  my $head_br = ( exists($STATUS{active_branch}) ? $STATUS{active_branch} : $STATUS{orig_branch} );
-
   if ( $branch eq $head_br ) {
     # If given "$branch" is the HEAD, perform a real "git merge" in order
     # to update also the working tree (and not only the repository)

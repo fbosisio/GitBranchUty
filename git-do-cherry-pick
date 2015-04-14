@@ -1,0 +1,236 @@
+#!/usr/local/bin/perl -w
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use Getopt::Long;
+use IO::Handle;
+#use Data::Dumper;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use GitCmd;
+
+# Only default values different from FALSE must be listed here ...
+my %OPTIONS = ( interact => TRUE );
+
+my %COLORS = (
+  I => '[33;40m',
+  B => '[30;42m',
+  N => '[m',
+  S => ' '
+);
+
+{ # -----[ main ]-----
+
+  my $br_to_cherry_pick = undef;
+  my @cherry_pick_opts = ();
+  &ManageOptions( \$br_to_cherry_pick, \@cherry_pick_opts );
+
+  # Here $git_r (R for "real") ALWAYS invokes the various git commands,
+  # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
+  # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
+  my $git_r = new GitCmd( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
+  my $git_s = $git_d->new( stopOnErrors => FALSE );
+
+  my $curr_br = &CurrentBranch( $git_r );
+
+  &Info( "Rebasing branch '$curr_br' on top of '$br_to_cherry_pick'" );
+  $git_s->cherry_pick( $br_to_cherry_pick, @cherry_pick_opts );
+  while ( $git_s->KO ) {
+    my $abort_cherry_pick = &ResolveConflicts( $git_r, $git_d, $git_s );
+    if ( $abort_cherry_pick ) {
+      &Info( "Running 'git cherry-pick --abort' to undo the cherry-pick" );
+      $git_d->cherry_pick( '--abort' );
+      exit 1;
+    }
+
+    print "\nYou can now $COLORS{B}continue$COLORS{N} the cherry-pick,",
+          " $COLORS{B}skip$COLORS{N} this commit and continue with next one",
+          " or $COLORS{B}abort$COLORS{N} the whole cherry-pick process.\n";
+    my $ans = &AskConfirmation( 'Continue with cherry-pick ?', TRUE );
+    if ( $ans ) { # i.e. answer is 'Y'
+      &Info( "Running 'git cherry-pick --continue' to resume the process" );
+      $git_d->cherry_pick( '--continue' );
+    } else {
+      $ans = &AskConfirmation( 'Skip commit and continue ?', TRUE );
+      if ( $ans ) { # i.e. answer is 'Y'
+        &Info( "Running 'git cherry-pick --skip' to proceed with next commit" );
+        $git_d->cherry_pick( '--skip' );
+      } else {
+        print "OK, aborting.\n";
+        &Info( "Running 'git cherry-pick --abort' to undo the cherry-pick" );
+        $git_d->cherry_pick( '--abort' );
+        exit 2;
+      }
+    }
+  } # END while
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub ResolveConflicts {
+  # ----- Function arguments -----
+  my( $git_r, $git_d, $git_s ) = @_;
+  # ----- Local variables -----
+  my $abort_cherry_pick = FALSE;
+  # ----- Function code -----
+  &Info( "Running 'git mergetool' to resolve conflicts" );
+  $git_s->mergetool;
+
+  my $edit_files = $git_s->KO || $OPTIONS{edit};
+
+  my( $output, $modified, $conflicts ) = &ParseGitStatus( $git_r );
+
+  if ( ! $edit_files ) {
+    &Info( "Showing 'git status'" );
+    print $output;
+    $output = undef; # To avoid showing it again below
+    if ( $#{$conflicts} >= 0 ) {
+      $edit_files = &AskConfirmation( 'Do you want to edit merged files ?',
+                                      FALSE );
+    }
+  }
+
+  if ( $edit_files ) {
+    my $editor = $git_r->var( 'GIT_EDITOR' );
+    $editor = "echo $editor" if ( $OPTIONS{dryrun} );
+    foreach my $file (@{$conflicts}) {
+      system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
+    } # END foreach
+
+    my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
+    $git_d->add( @{$conflicts} ) if ( $ans );
+
+    ( $output, $modified, $conflicts ) = &ParseGitStatus( $git_d );
+  }
+
+  if ( defined($output) ) {
+    &Info( "Showing 'git status'" );
+    print $output;
+  }
+  if ( $#{$conflicts} >= 0 ) {
+    print "\nThere are still unresolved conflicts! Abort forced.\n";
+    $abort_cherry_pick = TRUE;
+  }
+  # ----- Return value -----
+  $abort_cherry_pick;
+}
+
+#==============================================================================
+
+sub ManageOptions {
+  # ----- Local variables -----
+  my( $branch_to_cherry_pick, $options_for_cherry_pick ) = @_;
+  # ----- Function code -----
+  # Leave unrecognized options in ARGV, instead of flagging them as errors
+  &Getopt::Long::Configure( 'pass_through' );
+
+  &GetOptions( \%OPTIONS,
+               'verbose|v',
+               'dryrun|dry-run|n',
+               'pretty',
+               'interact!',
+               'edit|e',
+               'help|h|?' );
+  #print &Dumper( \%OPTIONS );
+
+  if ( $OPTIONS{help} ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    my $indent_space = ' ' x length($program_name);
+    print STDERR "
+  USAGE: $program_name [-v|--verbose] [-n|--dryrun|--dry-run] [--pretty]
+         $indent_space [--nointeract] [-e|--edit] [<git-cherry-pick-options>]
+         $indent_space <branch-to-cherry-pick>\n
+         --verbose    : print each underlying git command before execution
+         --dryrun     : just print git commands, but do not execute them
+         --pretty     : use ANSI colors to highlight step messages
+         --nointeract : avoid asking confirmations (assume everything OK)
+         --edit       : force editing of files with conflicts after cherry-pick
+                        (normally this only happens if 'mergetool' fails)\n
+         All other options are passed along to 'git cherry-pick'.\n\n";
+    exit 0;
+  }
+
+  $COLORS{I} = $COLORS{B} = $COLORS{N} = $COLORS{S} = '' unless ( $OPTIONS{pretty} );
+
+  my $branch_found = FALSE;
+  foreach my $arg (@ARGV) {
+    if ( $branch_found || $arg =~ /^-/ ) {
+      push( @{$options_for_cherry_pick}, $arg );
+    } else {
+      ${$branch_to_cherry_pick} = $arg;
+      $branch_found = TRUE;
+    }
+  } # END foreach
+
+  die "No <branch-to-cherry-pick> specified!\n" unless ( $branch_found );
+}
+
+#==============================================================================
+
+sub CurrentBranch {
+  # ----- Local variables -----
+  my( $git ) = @_;
+  # ----- Function code -----
+  my $current = $git->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#==============================================================================
+
+sub ParseGitStatus {
+  # ----- Local variables -----
+  my( $git ) = @_;
+  # ----- Local variables -----
+  my $output = ();
+  my @modified = ();
+  my @conflicts = ();
+  my $fh = new IO::Handle;
+  # ----- Function code -----
+  $git->status( $fh, '--untracked-files=no' );
+  while ( my $line = <$fh> ) {
+    $output .= $line;
+    push( @modified, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
+    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
+  }
+  $git->Close( $fh );
+  # ----- Return value -----
+  ( $output, \@modified, \@conflicts );
+}
+
+#==============================================================================
+
+sub Info {
+  print "\t$COLORS{I}$COLORS{S}@_ ...$COLORS{S}$COLORS{N}\n";
+}
+
+#==============================================================================
+
+sub AskConfirmation {
+  # ----- Function arguments -----
+  my( $msg, $default ) = @_;
+  # ----- Function code -----
+  return $default unless ( $OPTIONS{interact} );
+  while ( TRUE ) {
+    printf '%s [Y/N] » ', $msg;
+    if ( $OPTIONS{dryrun} ) {
+      print '', ($default ? 'Y' : 'N'), " [dryrun]\n";
+      return $default;
+    }
+    chomp( my $answer = <STDIN> );
+    return TRUE  if ( $answer =~ /^y$/i );
+    return FALSE if ( $answer =~ /^n$/i );
+  } # END while
+}
+
+#==============================================================================

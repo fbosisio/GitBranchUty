@@ -50,13 +50,14 @@ my %COLORS = (
       exit 1;
     }
 
-    print "\nYou can now $COLORS{B}continue$COLORS{N} the rebase,",
-          " $COLORS{B}skip$COLORS{N} this commit and continue with next one",
-          " or $COLORS{B}abort$COLORS{N} the whole rebase process.\n";
+    print "\nYou can now either\n",
+         " - $COLORS{B}continue$COLORS{N} the rebase process\n",
+         " - $COLORS{B}skip$COLORS{N} this commit and continue with next one\n",
+         " - $COLORS{B}abort$COLORS{N} the whole rebase process.\n";
     my $ans = &AskConfirmation( 'Continue with rebase ?', TRUE );
     if ( $ans ) { # i.e. answer is 'Y'
       &Info( "Running 'git rebase --continue' to resume the process" );
-      $git_d->rebase( '--continue' );
+      $git_s->rebase( '--continue' );
     } else {
       $ans = &AskConfirmation( 'Skip commit and continue ?', TRUE );
       if ( $ans ) { # i.e. answer is 'Y'

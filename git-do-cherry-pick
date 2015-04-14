@@ -27,9 +27,9 @@ my %COLORS = (
 
 { # -----[ main ]-----
 
-  my $br_to_cherry_pick = undef;
   my @cherry_pick_opts = ();
-  &ManageOptions( \$br_to_cherry_pick, \@cherry_pick_opts );
+  my @commits_to_cherry_pick = ();
+  &ManageOptions( \@commits_to_cherry_pick, \@cherry_pick_opts );
 
   # Here $git_r (R for "real") ALWAYS invokes the various git commands,
   # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
@@ -39,9 +39,15 @@ my %COLORS = (
   my $git_s = $git_d->new( stopOnErrors => FALSE );
 
   my $curr_br = &CurrentBranch( $git_r );
+  my @hash_to_cherry_pick = ();
+  foreach my $commit (@commits_to_cherry_pick) {
+    my $short_hash = &GitShortHash( $git_r, $commit );
+    push( @hash_to_cherry_pick, $short_hash );
+  }
 
-  &Info( "Rebasing branch '$curr_br' on top of '$br_to_cherry_pick'" );
-  $git_s->cherry_pick( $br_to_cherry_pick, @cherry_pick_opts );
+  my $commits_list = join( "', '", @hash_to_cherry_pick );
+  &Info( "Cherry-picking commits '$commits_list' on top of '$curr_br'" );
+  $git_s->cherry_pick( @cherry_pick_opts, @hash_to_cherry_pick );
   while ( $git_s->KO ) {
     my $abort_cherry_pick = &ResolveConflicts( $git_r, $git_d, $git_s );
     if ( $abort_cherry_pick ) {
@@ -50,13 +56,14 @@ my %COLORS = (
       exit 1;
     }
 
-    print "\nYou can now $COLORS{B}continue$COLORS{N} the cherry-pick,",
-          " $COLORS{B}skip$COLORS{N} this commit and continue with next one",
-          " or $COLORS{B}abort$COLORS{N} the whole cherry-pick process.\n";
+    print "\nYou can now either:\n",
+         " - $COLORS{B}continue$COLORS{N} the cherry-pick process\n",
+         " - $COLORS{B}skip$COLORS{N} this commit and continue with next one\n",
+         " - $COLORS{B}abort$COLORS{N} the whole cherry-pick process.\n";
     my $ans = &AskConfirmation( 'Continue with cherry-pick ?', TRUE );
     if ( $ans ) { # i.e. answer is 'Y'
       &Info( "Running 'git cherry-pick --continue' to resume the process" );
-      $git_d->cherry_pick( '--continue' );
+      $git_s->cherry_pick( '--continue' );
     } else {
       $ans = &AskConfirmation( 'Skip commit and continue ?', TRUE );
       if ( $ans ) { # i.e. answer is 'Y'
@@ -127,7 +134,7 @@ sub ResolveConflicts {
 
 sub ManageOptions {
   # ----- Local variables -----
-  my( $branch_to_cherry_pick, $options_for_cherry_pick ) = @_;
+  my( $commits_to_cherry_pick, $options_for_cherry_pick ) = @_;
   # ----- Function code -----
   # Leave unrecognized options in ARGV, instead of flagging them as errors
   &Getopt::Long::Configure( 'pass_through' );
@@ -148,7 +155,7 @@ sub ManageOptions {
     print STDERR "
   USAGE: $program_name [-v|--verbose] [-n|--dryrun|--dry-run] [--pretty]
          $indent_space [--nointeract] [-e|--edit] [<git-cherry-pick-options>]
-         $indent_space <branch-to-cherry-pick>\n
+         $indent_space <commits-to-cherry-pick>\n
          --verbose    : print each underlying git command before execution
          --dryrun     : just print git commands, but do not execute them
          --pretty     : use ANSI colors to highlight step messages
@@ -161,17 +168,17 @@ sub ManageOptions {
 
   $COLORS{I} = $COLORS{B} = $COLORS{N} = $COLORS{S} = '' unless ( $OPTIONS{pretty} );
 
-  my $branch_found = FALSE;
+  my $commit_found = FALSE;
   foreach my $arg (@ARGV) {
-    if ( $branch_found || $arg =~ /^-/ ) {
+    if ( $arg =~ /^-/ ) {
       push( @{$options_for_cherry_pick}, $arg );
     } else {
-      ${$branch_to_cherry_pick} = $arg;
-      $branch_found = TRUE;
+      push( @{$commits_to_cherry_pick}, $arg );
+      $commit_found = TRUE;
     }
   } # END foreach
 
-  die "No <branch-to-cherry-pick> specified!\n" unless ( $branch_found );
+  die "No <commit-to-cherry-pick> specified!\n" unless ( $commit_found );
 }
 
 #==============================================================================
@@ -231,6 +238,24 @@ sub AskConfirmation {
     return TRUE  if ( $answer =~ /^y$/i );
     return FALSE if ( $answer =~ /^n$/i );
   } # END while
+}
+
+#------------------------------------------------------------------------------
+
+sub GitShortHash {
+  # ----- Function arguments -----
+  my( $git_r, $ref ) = @_;
+  # ----- Function code -----
+  my $short_hash;
+  my $git_s = $git_r->new( stopOnErrors => FALSE );
+  my @hashes = $git_s->show_ref( '--hash=7', "'$ref'" );
+  if ( $git_s->KO ) { 
+    ( $short_hash ) = ( $ref =~ /^(\w{7})/ );
+  } else {
+    $short_hash = $hashes[0];
+  }
+  # ----- Return value -----
+  $short_hash;
 }
 
 #==============================================================================

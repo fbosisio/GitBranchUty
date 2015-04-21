@@ -1,8 +1,9 @@
-#!/usr/local/bin/perl -w
+#!/usr/bin/env perl
 #------------------------------------------------------------------------------
 # $Id$
 #------------------------------------------------------------------------------
 
+use warnings;
 use strict;
 
 use constant TRUE  => (1 == 1);
@@ -29,10 +30,12 @@ my %COLORS = (
 
   # Here $git_r (R for "real") ALWAYS invokes the various git commands,
   # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
-  # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
+  # Finally $git_rs and $git_ds (S for "safe") are like $git_r and $git_d 
+  # respectively, but do not fail on errors.
   my $git_r = new GitDoMerge( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
   my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
-  my $git_s = $git_d->new( stopOnErrors => FALSE );
+  my $git_rs = $git_r->new( stopOnErrors => FALSE );
+  my $git_ds = $git_d->new( stopOnErrors => FALSE );
 
   my $curr_br = $git_r->CurrentBranch;
 
@@ -40,15 +43,23 @@ my %COLORS = (
   my $abort_merge = FALSE;
 
   &Info( "Merging branch '$br_to_merge' into '$curr_br'" );
-  $git_s->merge( $br_to_merge, '--no-commit', @merge_opts );
+  $git_ds->merge( $br_to_merge, '--no-commit', @merge_opts );
 
-  if ( $git_s->KO ) {
+  if ( $git_ds->KO ) {
     $ask_before_commit = TRUE;
     if ( $OPTIONS{'fail-if-conflict'} ) {
       $abort_merge = TRUE;
       $OPTIONS{interact} = FALSE; # Disable interaction, to force aborting
     } else {
-      $abort_merge = &ResolveConflicts( $git_r, $git_d, $git_s );
+      my @opts = ();
+      push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
+      push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+      push( @opts, '--pretty' ) if ( $OPTIONS{pretty} );
+      push( @opts, '--nointeract' ) unless ( $OPTIONS{interact} );
+      push( @opts, '--edit' ) if ( $OPTIONS{edit} );
+      # Here we use "$git_rs" since we also pass "--dryrun" option (if present)
+      $git_rs->resolve_conflicts( @opts );
+      $abort_merge = $git_rs->KO;
     }
   }
 
@@ -101,57 +112,6 @@ my %COLORS = (
   $git_d->commit( @commit_opts );
 
 } # -----[ main ]-----
-
-#==============================================================================
-
-sub ResolveConflicts {
-  # ----- Function arguments -----
-  my( $git_r, $git_d, $git_s ) = @_;
-  # ----- Local variables -----
-  my $abort_merge = FALSE;
-  # ----- Function code -----
-  &Info( "Running 'git mergetool' to resolve conflicts" );
-  $git_s->mergetool;
-
-  my $edit_files = $git_s->KO || $OPTIONS{edit};
-
-  my( $output, $merged, $conflicts ) = $git_r->ParseGitStatus;
-
-  if ( ! $edit_files ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-    $output = undef; # To avoid showing it again below
-    if ( $#{$conflicts} >= 0 ) {
-      $edit_files = &AskConfirmation( 'Do you want to edit merged files ?',
-                                      FALSE );
-    }
-  }
-
-  if ( $edit_files ) {
-    my $editor = $git_r->var( 'GIT_EDITOR' );
-    $editor = "echo $editor" if ( $OPTIONS{dryrun} );
-    foreach my $file (@{$conflicts}) {
-      print "Opening editor ('$editor') on '$file' as requested ...\n";
-      system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
-    } # END foreach
-
-    my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
-    $git_d->add( @{$conflicts} ) if ( $ans );
-
-    ( $output, $merged, $conflicts ) = $git_d->ParseGitStatus;
-  }
-
-  if ( defined($output) ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-  }
-  if ( $#{$conflicts} >= 0 ) {
-    print "\nThere still are unresolved conflicts! Abort forced.\n";
-    $abort_merge = TRUE;
-  }
-  # ----- Return value -----
-  $abort_merge;
-}
 
 #==============================================================================
 
@@ -292,35 +252,12 @@ sub CurrentBranch {
 
 #------------------------------------------------------------------------------
 
-sub ParseGitStatus {
-  # ----- Local variables -----
-  my( $self ) = @_;
-  # ----- Local variables -----
-  my $output = ();
-  my @merged = ();
-  my @conflicts = ();
-  my $fh = new IO::Handle;
-  # ----- Function code -----
-  $self->status( $fh, '--untracked-files=no' );
-    while ( my $line = <$fh> ) {
-      $output .= $line;
-      push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
-      push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
-    }
-  $self->Close( $fh );
-  # ----- Return value -----
-  ( $output, \@merged, \@conflicts );
-}
-
-#------------------------------------------------------------------------------
-
 sub MergeInProgress {
   # ----- Function arguments -----
   my( $self ) = @_;
   # ----- Function code -----
   my $git_dir = $self->rev_parse( '--git-dir' );
   # ----- Return value -----
-#.git/CHERRY_PICK_HEAD
   -f "$git_dir/MERGE_HEAD";
 }
 

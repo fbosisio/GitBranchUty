@@ -1,447 +1,433 @@
-#!/bin/sh
+#!/usr/bin/env perl
 #------------------------------------------------------------------------------
 # $Id$
 #------------------------------------------------------------------------------
 
-function Info {
-  printf '\t[30;41m %s ... [m\n' "$@"
+use warnings;
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use Getopt::Long;
+#use Data::Dumper;
+
+# Only default values different from FALSE must be listed here ...
+my %OPTIONS = (
+  pretty   => TRUE,
+  interact => TRUE,
+  restore  => TRUE
+);
+
+my %COLORS = (
+  B => '[33;40m',
+  I => '[30;42m',
+  N => '[m',
+  S => ' '
+);
+
+{ # -----[ main ]-----
+
+  &ManageOptions();
+
+  my $git = new GitPromote( verbose => ( $OPTIONS{verbose} ? 1 : 0 ),
+                            chompArrays => TRUE );
+
+  if ( exists($OPTIONS{author}) && ( $OPTIONS{author} =~ /^~/ ) ) {
+    &Info( 'Getting author name' );
+    my( $name, $email ) = $git->UserFromConfig( $OPTIONS{author} );
+    my $author = $name;
+    $author .= " <$email>" unless ( $email eq '' );
+    die "No name/email for author '$OPTIONS{author}' !\n" if ( $author eq '' );
+    print "Commit author will be\n$COLORS{B}$author$COLORS{N}\n";
+    $OPTIONS{author} = $author;
+  }
+
+  unless ( $git->AliasExists('branch-order') ) {
+    &RequireBranchOrder();
+    exit 1;
+  }
+
+  my $start_br = $git->CurrentBranch;
+
+  if ( ! $OPTIONS{message} ) {
+    my $commit = $start_br;
+    if ( $OPTIONS{continue} ) {
+      &Info( 'Resuming previous invocation' );
+      $OPTIONS{continue} = $commit = $git->NonMergeAncestor( $start_br );
+      die "No previous invocation to resume !\n" if ( $commit eq $start_br );
+    }
+    my $msg = $git->log( '-1', '--pretty=%s', $commit );
+    $msg =~ s/\s+\(cherry picked from commit [a-f\d]+\)//; # Drop cherry-pick
+    print "The following commit-message will be used:\n",
+          "$COLORS{B}$msg$COLORS{N}\n";
+    unless ( $OPTIONS{continue} ) {
+      my $ok = &AskConfirmation( 'Do you confirm the commit message ?', TRUE );
+      exit 1 unless ( $ok ); # Answer is 'N'
+    }
+    $OPTIONS{message} = $msg;
+  }
+
+  if ( $^O eq 'msys' ) { # Only on WIN
+    # Apparently, it seems that sometimes this command has problems when
+    # run automatically instead of explicitly ... (but only on this OS)
+    &Info( 'Compacting repository (if needed)' );
+    $git->gc( '--auto' );
+  }
+  &Info( 'Fetching remote repository' );
+  $git->fetch;
+
+  &Info( 'Building branch sequence' );
+  my $update_master;
+  my @branch_list = $git->branch_order( $start_br );
+  # Remove last branch from list if it is 'master'
+  if ( $branch_list[$#branch_list] eq 'master' ) {
+    pop @branch_list;
+    $update_master = ( $#branch_list < 0 ? $start_br : $branch_list[$#branch_list] );
+  }
+  # Remove first branch from list, if it is the current one
+  shift @branch_list if ( $#branch_list >= 0 && $branch_list[0] eq $start_br );
+
+  my @from_prev_run = ();
+  if ( $OPTIONS{continue} ) {
+    &Info( 'Retrieving branches managed in previous invocation' );
+    &BranchesFromPreviousRun( $git, $OPTIONS{continue}, $start_br,
+                              \@branch_list, \@from_prev_run );
+    print "No branch processed in previous run.\n" if ( $#from_prev_run < 0 );
+  }
+
+  if ( exists($OPTIONS{'already-in'}) || exists($OPTIONS{'skip-from'}) ) {
+    my $stop_at = $OPTIONS{'already-in'} || $OPTIONS{'skip-from'};
+    my $found = FALSE;
+    for ( my $i=0; $i<=$#branch_list; ++$i ) {
+      my $branch = $branch_list[$i];
+      if ( $branch eq $stop_at ) { $#branch_list = $i; $found = TRUE; last; }
+    } # END for
+    die "Branch '$stop_at' not found or not in merge-list !\n" if ( ! $found );
+  }
+
+  &Info( 'Checking local tracking branches' );
+  my $remote = $git->UpstreamBranch( $start_br );
+  $remote =~ s!/$start_br$!!;
+
+  my %tracked = $git->TrackedBranches( $remote );
+  foreach my $br (@branch_list) {
+    unless ( exists($tracked{$br}) ) {
+      # Setup local tracking branch if not already present
+      $git->branch( $br, "remotes/$remote/$br" );
+    }
+  } # END foreach
+
+
+  my @opts = ( '--nofetch' );
+  push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
+  push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+  push( @opts, '--nopretty' ) unless ( $OPTIONS{pretty} );
+  push( @opts, '--norestore' ) unless ( $OPTIONS{restore} );
+  if ( $#branch_list >= 0 ) {
+    my @seqMerge_opts = ( '-m', "'$OPTIONS{message}'" );
+    push( @seqMerge_opts, '--edit' ) if ( $OPTIONS{edit} );
+    push( @seqMerge_opts, '--nointeract' ) unless ( $OPTIONS{interact} );
+    push( @seqMerge_opts, "--author='$OPTIONS{author}'" ) if ( $OPTIONS{author} );
+    push( @seqMerge_opts, "--run='$OPTIONS{run}'" ) if ( $OPTIONS{run} );
+    push( @seqMerge_opts, "--last-merge-opts='-X ours'" ) if ( $OPTIONS{'already-in'} );
+    push( @seqMerge_opts, "--last-merge-opts='-s ours'" ) if ( $OPTIONS{'skip-from'} );
+    &Info( 'Merging current branch', $start_br, 'into', join(', ',@branch_list) );
+    $git->seq_merge( @opts, @seqMerge_opts, @branch_list ); # $git --dryrun(?)
+  } else {
+    &Info( 'Pushing current branch', $start_br );
+    $git->synch( @opts, '--mode=push', $start_br ); # $git --dryrun(?)
+  }
+
+  if ( $#from_prev_run >= 0 ) {
+    &Info( 'Pushing branches from previous run (', join(', ',@from_prev_run), ')' );
+    $git->synch( @opts, '--mode=push', @from_prev_run ); # $git --dryrun(?)
+  }
+
+  if ( defined($update_master) ) {
+    &Info( "Re-aligning 'master' to branch '$update_master'" );
+    my $git_dry = $git->new( printOnly => $OPTIONS{dryrun} );
+    $git_dry->ff_merge( 'master', $update_master );
+    $git_dry->push( 'origin', 'master' );
+  }
+
+  print "\n\t$COLORS{I}$COLORS{S}... done.$COLORS{S}$COLORS{N}\n\n";
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub ManageOptions {
+  # ----- Function code -----
+  &GetOptions( \%OPTIONS,
+               'verbose|v',
+               'dryrun|dry-run|n',
+               'pretty!',
+               'interact!',
+               'restore!',
+               'continue',
+               'edit|e',
+               'run=s',
+               'message|m=s',
+               'author=s',
+               'already-in=s',
+               'skip-from=s',
+               'help|h|?' ) or die "ERROR: option parsing failed!\n";
+  #print &Dumper( \%OPTIONS );
+
+  if ( $OPTIONS{help} ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    my $indent_space = ' ' x length($program_name);
+    print STDERR "
+  USAGE: $program_name [-v|--verbose] [-n|--dry[-]run] [--no[-]pretty]
+         $indent_space [--no[-]interact] [--no[-]restore] [--continue]
+         $indent_space [-e|--edit] [--run=<command>] [-m <msg>|--message=<msg>]
+         $indent_space [--author=<name>] [--already-in=<br>|--skip-from=<br>]\n
+     --verbose         : print each underlying git command before execution
+     --dryrun          : just print git commands, but do not execute them
+     --nopretty        : do not use ANSI colors to highlight step messages
+     --nointeract      : avoid asking confirmations (assume everything OK)
+     --norestore       : do not revert back to original branch (if changed)
+     --continue        : resume a previously stopped '$program_name' execution
+     --edit            : force editing of files with conflicts after merge
+                         (normally this only happens if 'mergetool' fails)
+     --run=<cmd>       : execute 'cmd' before committing each merge step
+                         (if 'cmd' exits non-zero, the merge is aborted)
+     --message=<msg>   : use <msg> as comment for merge commits
+                         (default is to re-use the log message of last commit)
+     --author=<auth>   : use '<auth>' as author of the merge commits
+                         (you can also use '~<username>' as author, to take
+                         name and e-mail from his/her 'git config')
+     --already-in=<br> : when branch <br> is reached, do 'merge -X ours' and
+                         stop (since change is ALREADY PRESENT in <br>)
+     --skip-from=<br>  : when branch <br> is reached, do 'merge -s ours' and
+                         stop (since change is NOT DESIRED in <br>).\n\n";
+    exit 0;
+  }
+
+  if ( exists($OPTIONS{'already-in'}) && exists($OPTIONS{'skip-from'}) ) {
+    die "Options '--already-in' and '--skip-from' are mutually exclusive !\n";
+  }
+
+  $COLORS{I} = $COLORS{B} = $COLORS{N} = $COLORS{S} = '' unless ( $OPTIONS{pretty} );
+}
+
+#==============================================================================
+
+sub Info {
+  print "\t$COLORS{I}$COLORS{S}@_ ...$COLORS{S}$COLORS{N}\n";
+}
+
+#==============================================================================
+
+sub AskConfirmation {
+  # ----- Function arguments -----
+  my( $msg, $default ) = @_;
+  # ----- Function code -----
+  return $default unless ( $OPTIONS{interact} );
+  while ( TRUE ) {
+    printf '%s [Y/N] » ', $msg;
+    if ( $OPTIONS{dryrun} ) {
+      print '', ($default ? 'Y' : 'N'), " [dryrun]\n";
+      return $default;
+    }
+    chomp( my $answer = <STDIN> );
+    return TRUE  if ( $answer =~ /^y$/i );
+    return FALSE if ( $answer =~ /^n$/i );
+  } # END while
+}
+
+#==============================================================================
+
+sub BranchesFromPreviousRun {
+  # ----- Function arguments -----
+  my( $git, $commit, $start_branch, $selected_branches, $branches_to_add ) = @_;
+  # ----- Function code -----
+  my @branches = $git->BranchesIncludingCommit( $commit );
+  foreach my $new_br (@branches) {
+    my $present = FALSE;
+    foreach my $br ($start_branch, @{$selected_branches}, 'master') {
+      if ( $br eq $new_br ) { $present = TRUE; last; }
+    } # END foreach
+    push( @{$branches_to_add}, $new_br ) unless ( $present );
+  } # END foreach
+}
+
+#==============================================================================
+
+sub RequireBranchOrder {
+  # ----- Function code -----
+  print STDERR "
+     Sorry, no 'branch-order' command configured.
+     You need to define a git-alias for this!.\n
+     For example, if all your branches are named like 'Rx.y' and the order
+     of branches can be obtained by numerically comparing the various
+     dot-separated fields (in order), you can use:\n
+        git config [--global] alias.branch-order 'seq-branch-dotted --prefix=R'\n
+     If you use a prefix different from 'R' (or no prefix at all) you can
+     simply adapt the above command.
+     If, instead, the order of your branches can be obtained inspecting the
+     file 'branch.config' in each branch, you can use:\n
+        git config [--global] alias.branch-order 'seq-branch-config'\n
+     Finally, you can even define your own branch-sorting command, if you need.
+\n";
+}
+
+#==============================================================================
+#==============================================================================
+
+package GitPromote;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub UpstreamBranch {
+  # ----- Function arguments -----
+  my( $self, $branch ) = @_;
+  # ----- Return value -----
+  $self->rev_parse( '--abbrev-ref', "$branch\@{upstream}", '2>/dev/null' );
 }
 
 #------------------------------------------------------------------------------
 
-function SubInfo {
-  printf '\t\t[33;40m %s ... [m\n' "$@"
+sub BranchesIncludingCommit {
+  # ----- Function arguments -----
+  my( $self, $commit ) = @_;
+  # ----- Local variables -----
+  my @branches = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  my $safe_git = $self->new( stopOnErrors => FALSE );
+  $safe_git->branch( $fh, '--contains', $commit, '2>/dev/null' );
+    while ( my $line = <$fh> ) {
+      next if ( $line =~ /\s->\s/);
+      chomp( $line );
+      $line =~ s/^\s*\*?\s*//;
+      push( @branches, $line );
+    }
+  $safe_git->Close( $fh );
+  # ----- Return value -----
+  @branches;
 }
 
 #------------------------------------------------------------------------------
 
-function Usage {
-  local PROGRAM=$(basename $0 | /bin/sed 's/-/ /')
-  /bin/cat >&2 << HERE
-
-	[1;7m USAGE: ${PROGRAM} [-m <commit-message>] [--test] [--no-interact] [m
-			   [1;7m [--already-in=<branch>] [--skip-from=<branch>] [m
-			   [1;7m [--backward=<branch>] [--edit] [m
-                           [1;7m [-stay=<branch>] [-author=<username>] [m
-
-		Merge current branch into all subsequent branches,
-		one by one and in the proper order.
-		Commit message will include given message, beside merge info.
-		A preliminary 'pull' on all subsequent branches is
-		automatically performed; at the end, current branch and all
-		subsequent ones are pushed to the remote repository.
-		Each merge step includes running 'git mergetool' if needed
-		and can be verifyed or stopped before it is completed.
-
-	 -m "<commit-msg>" : if omitted, message is taken from last commit
-	 --test            : just print the commands, instead of executing them
-	 --no-interact     : do not ask for confirmation after each merge
-	 --already-in=<br> : when branch <br> reached, do "merge -X ours" and
-                             stop (since change is ALREADY PRESENT in <br>)
-	 --skip-from=<br>  : when branch <br> reached, do "merge -s ours" and
-                             stop (since change is NOT DESIRED in <br>)
-	 --backward=<br>   : cherry-pick last commit to branch <br> and then
-			     promote (implies "--already-in=<current-branch>")
-	 --edit            : let the user modify the files after each merge step
-         -stay=<br>        : leave <br> active (do not go back to original one)
-	 -author=<user>    : use given <username> as author (name and e-mail)
-
-HERE
-  exit $1
+sub NonMergeAncestor {
+  # ----- Function arguments -----
+  my( $self, $commit ) = @_;
+  # ----- Function code -----
+  while ( TRUE ) {
+    my @parents = $self->CommitParents( $commit );
+    last if ( $#parents < 1 );
+    $commit = $parents[$#parents]; # Last parent is the "remote", if a merge
+  } # END while
+  # ----- Return value -----
+  $commit;
 }
 
 #------------------------------------------------------------------------------
 
-function ask_for_confirmation {
-  local MSG="$1"
-  local FORCE="$2"
-  [ "${NON_INTERACTIVE}" -a -z "${FORCE}" ] && return 0
-  local ANSWER
-  while /bin/true; do
-    printf '%s [Y/N] » ' "${MSG}"
-    read ANSWER
-    case "${ANSWER}" in
-      y|Y) return 0 ;;
-      n|N) return 1 ;;
-      *) # Repeat the loop
-    esac
-  done
+sub CommitParents {
+  # ----- Function arguments -----
+  my( $self, $commit ) = @_;
+  # ----- Local variables -----
+  my @parents = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $self->cat_file( $fh, '-p', $commit );
+    while ( my $line = <$fh> ) {
+      push( @parents, $1 ) if ( $line =~ /^parent\s+(\w+)\s*$/ );
+    }
+  $self->Close( $fh );
+  # ----- Return value -----
+  @parents;
 }
 
 #------------------------------------------------------------------------------
 
-function run_git_commit {
-  local COMMIT_MSG="$1"
-  if [ "${GIT_AUTHOR}" ]; then
-    ${RUN} git commit -m "${COMMIT_MSG}" "${GIT_AUTHOR}"
-  else
-    ${RUN} git commit -m "${COMMIT_MSG}"
-  fi
-  if [ $? -ne 0 ]; then
-    printf 'ERROR: "git commit" failed - merge aborted !\n' >&2
-    exit 3
-  fi
+# The logic of this routine is based on the shell script found at:
+# http://stackoverflow.com/questions/4950725/how-do-i-get-git-to-show-me-which-branches-are-tracking-what
+sub TrackedBranches {
+  # ----- Function arguments -----
+  my( $self, $remote ) = @_;
+  # ----- Local variables -----
+  my %tracked = ();
+  # ----- Function code -----
+  my $safe_git = $self->new( stopOnErrors => FALSE );
+  my $fh = new IO::Handle;
+  $self->for_each_ref( $fh, "--format='%(refname:short)'", 'refs/heads' );
+    while ( my $br = <$fh> ) {
+      chomp( $br );
+      my $upstr = $safe_git->UpstreamBranch( $br );
+      next if ( $safe_git->KO );
+      next unless ( $upstr =~ s!^$remote/!! );
+      $tracked{$upstr} = $br;
+    }
+  $self->Close( $fh );
+  # ----- Return value -----
+  %tracked;
 }
 
 #------------------------------------------------------------------------------
 
-function do_git_merge {
-  local NEW_REV="$1"
-  local OLD_REV="$2"
-  local MSG="$3"
-  local MERG_TYPE="$4"
-  local OPTS="$5"
-  local B='[30;42m'
-  local N='[m'
-
-  SubInfo "Checking-out branch '${NEW_REV}'"
-  ${RUN} git checkout "${NEW_REV}"
-  if [ $? -ne 0 ]; then
-    printf '\n\tFATAL: git checkout failed !!!\n\n' >&2
-    exit 6
-  fi
-
-  #SubInfo "Re-running 'git pull' to make sure branch is aligned"
-  #${RUN} git pull
-
-  SubInfo "Merging branch '${OLD_REV}' into '${NEW_REV}'"
-  ${RUN} git merge "${OLD_REV}" --no-commit ${OPTS}
-
-  SubInfo "Showing 'git status'"
-  ${RUN} git status -uno
-
-  SubInfo "Running 'git mergetool' if needed"
-  ${RUN} git mergetool
-
-  if [ "${EDIT_MERGE}" ]; then
-    ask_for_confirmation 'Do you want to edit merged files before proceeding ?'
-    if [ $? -eq 0 ]; then # Answer is 'Y'
-      local FILES=$(git status | \
-                    /bin/awk '/modified:|new file:/{ printf "%s ",$3 }')
-      ${RUN} ${EDITOR:-vi} ${FILES}
-      printf '\tPress ENTER to continue ...\n'
-      read
-      ${RUN} git add ${FILES}
-    fi
-  fi
-
-  printf "\nYou can now ${B}commit${N} the merge, leave it ${B}pending${N}"
-  printf " or ${B}abort${N} it.\n"
-  ask_for_confirmation 'Proceed with merge ?'
-  if [ $? -ne 0 ]; then # Answer is 'N'
-    printf 'OK, going to stop the "promote" process.\n'
-    printf 'But what do you want to do with current merge step?\n'
-    printf ' - cancel it (you need to REDO the merge manually then !)\n'
-    printf ' - leave it pending (you can make changes and commit the merge).\n'
-    ask_for_confirmation 'Undo merge and revert to original state ?'
-    if [ $? -eq 0 ]; then # Second answer is 'Y'
-      Info "Undoing merge with 'git merge --abort'"
-      ${RUN} git merge --abort
-      Info "Re-showing 'git status'"
-      ${RUN} git status -uno
-    else  # Second answer is 'N'
-      printf '\nWARNING: leaving the merge pending as requested !\n\t '
-      printf '(complete with "git commit" or undo with "git merge --abort")\n\n'
-    fi
-    exit 2
-  fi
-
-  SubInfo "Running 'git commit' to conclude merge"
-  run_git_commit "${MERG_TYPE}ed ${OLD_REV} into ${NEW_REV} (${MSG})"
+sub CurrentBranch {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
 }
 
 #------------------------------------------------------------------------------
 
-function git_ff_merge {
-  local BRANCH="$1"
-  local COMMIT="$2"
-
-  local BRANCH_HASH=$(git show-ref -s --verify "refs/heads/${BRANCH}" 2>/dev/null)
-  if [ $? -ne 0 ]; then
-    printf "Error: unknown BRANCH ${BRANCH}\n" >&2
-    return 1
-  fi
-
-  local COMMIT_HASH=$(git rev-parse --verify --quiet "${COMMIT}")
-  if [ $? -ne 0 ]; then
-    printf "Error: unknown revision ${COMMIT}\n" >&2
-    return 2
-  fi
-
-  local BASE_HASH=$(git merge-base "${BRANCH_HASH}" "${COMMIT_HASH}")
-  if [ "${BASE_HASH}" != "${BRANCH_HASH}" ]; then
-    printf "WARNING: merging ${COMMIT} into ${BRANCH} would not be a fast-forward\n" >&2
-    return 3
-  fi
-  local BRANCH_SHORT_HASH=$(echo "${BRANCH_HASH}" | sed 's/^\(.......\).*$/\1/')
-  local COMMIT_SHORT_HASH=$(echo "${COMMIT_HASH}" | sed 's/^\(.......\).*$/\1/')
-  printf "Updating ${BRANCH_SHORT_HASH}..${COMMIT_SHORT_HASH}\n"
-  git update-ref -m "merge ${COMMIT}: Fast forward" "refs/heads/${BRANCH}" \
-                    "${COMMIT_HASH}" "${BRANCH_HASH}"
-  if [ $? -ne 0 ]; then
-    printf 'Error: fast forward using update-ref failed\n' >&2
-    return 4
-  fi
-  printf 'Fast forward\n'
-  git --no-pager diff --stat "${BRANCH}@{1}" "${BRANCH}"
-  [ $? -eq 0 ] || printf 'Warning: "git diff" failed\n'
+sub UserFromConfig {
+  # ----- Function arguments -----
+  my( $self, $user ) = @_;
+  # ----- Local variables -----
+  my $name = '';
+  my $email = '';
+  # ----- Function code -----
+  my $safe_git = $self->new( stopOnErrors => FALSE );
+  my $fh = new IO::Handle;
+  $safe_git->config( $fh, '--file', "$user/.gitconfig",
+                          '--get-regexp', 'user\.[ne]' );
+    while ( my $line = <$fh> ) {
+      chomp( $line );
+      $name  = $line if ( $line =~ s/^user\.name\s+// );
+      $email = $line if ( $line =~ s/^user\.email\s+// );
+    }
+  $safe_git->Close( $fh );
+  # ----- Return value -----
+  ( $name, $email );
 }
 
 #------------------------------------------------------------------------------
 
-function run_with_stderr_logging {
-  local STDERR_FILE="$1"
-  shift
-  # The sequence "3>&1 1>&2 2>&3" swaps stdout and stderr
-  # The usage of a sub-shell allows swapping them back after "tee" invocation
-  ("$@" 3>&1 1>&2 2>&3 | /usr/bin/tee "${STDERR_FILE}") 3>&1 1>&2 2>&3
+sub AliasExists {
+  # ----- Function arguments -----
+  my( $self, $alias ) = @_;
+  # ----- Function code -----
+  my $safe_git = $self->new( stopOnErrors => FALSE );
+  # Search git config-files for the given param (returns '' if not found)
+  my $expansion = $safe_git->config( '--get', "alias.$alias" );
+  # ----- Return value -----
+  ( $expansion ne '' );
 }
 
 #------------------------------------------------------------------------------
 
-function read_branch_config {
-  local BRANCH="$1"
-  local GIT_ERRORS_FILE="$2"
-  run_with_stderr_logging "${GIT_ERRORS_FILE}" git --no-pager show \
-        "remotes/origin/${BRANCH}:branch.config"
-  if [ $? -ne 0 ]; then
-    exit $?
-  fi
-}
+# module return code
+TRUE;
 
-#------------------------------------------------------------------------------
-
-# Avoid problem with "strange" user settigns ...
-unset ENV
-export PS1='$ '
-
-unset GIT_AUTHOR FINAL_BRANCH RUN NON_INTERACTIVE STOP_AT_BRANCH STOP_AT_FLAG
-unset BACKWARD_TO EDIT_MERGE M_FLAG
-for ARG in "$@"; do
-  [ "${M_FLAG}" = '1' ] && M_FLAG=2
-  case "${ARG}" in
-    -\?|-h|-help|--help) Usage 0 ;;
-    -m) M_FLAG=1 ;;
-    -author=*) GIT_AUTHOR=${ARG#-author=}
-               GITCFG="/users/${GIT_AUTHOR}/.gitconfig"
-               GITNAME=$(/bin/awk '/^[ \t]*name[ \t]*=/{ print $3,$4 }' ${GITCFG})
-               GITMAIL=$(/bin/awk '/^[ \t]*email[ \t]*=/{ print $3 }' ${GITCFG})
-               GIT_AUTHOR="--author=${GITNAME} <${GITMAIL}>"
-               unset GITCFG GITNAME GITMAIL ;;
-    -stay=*) FINAL_BRANCH=${ARG#-stay=} ;;
-    --test) RUN=echo ;;
-    --no-interact) NON_INTERACTIVE=1 ;;
-    --already-in=*) STOP_AT_BRANCH=${ARG#--already-in=}
-                    STOP_AT_FLAG='X' ;;
-    --skip-from=*) STOP_AT_BRANCH=${ARG#--skip-from=}
-                   STOP_AT_FLAG='s' ;;
-    --backward=*) BACKWARD_TO=${ARG#--backward=} ;;
-    --edit) EDIT_MERGE=1 ;;
-    -*) printf 'Unknown option "%s" !\n' "${ARG}" >&2
-        Usage 1 ;;
-    *) if [ "${M_FLAG}" = '2' ]; then
-         MESSAGE="${ARG}"
-         unset M_FLAG
-       else
-         printf 'Unknown argument "%s" (forgot "-m" ?) !\n' "${ARG}" >&2
-         Usage 2
-       fi
-  esac
-done
-if [ "${M_FLAG}" ]; then
-  printf 'Missing argument after "-m" !\n' >&2
-  Usage 3
-fi
-unset M_FLAG
-
-# Check commit message ...
-if [ -z "${MESSAGE}" ]; then
-  MESSAGE=$(git --no-pager log -1 --pretty=format:%s%n | \
-            /bin/sed -e 's/Merged* [^ ]* into [^ ]* (//' -e 's/ *)$//')
-fi
-while /bin/true; do
-  printf 'The following commit-message will be used:\n\t[1;7m%s[m\n' \
-         "${MESSAGE}"
-  ask_for_confirmation 'Do you confirm the message ?' '-force'
-  [ $? -eq 0 ] && break # If answer is 'Y', stop loop
-  unset MESSAGE
-  while [ -z "${MESSAGE}" ]; do
-    printf 'Insert a commit-message (CTRL-C to abort) : '
-    read MESSAGE
-  done
-done
-
-ACTIVE=$(git --no-pager branch | /bin/grep '^\*' | \
-         /bin/sed -e 's/\* //' -e 's///')
-
-START_BR="${ACTIVE}"
-if [ "${BACKWARD_TO}" ]; then
-  if [ -z "${STOP_AT_BRANCH}" ]; then
-    printf '\tProcess will stop (with "merge -%s ours") at branch "%s".\n' \
-           "${STOP_AT_FLAG}" "${ACTIVE}"
-    STOP_AT_BRANCH="${ACTIVE}"
-  fi
-  START_BR="${BACKWARD_TO}"
-fi
-
-BRANCH_CONFIG_FAILURE_FILE="git_branch_config.$$.err"
-> "${BRANCH_CONFIG_FAILURE_FILE}"
-MATCHED=$(BR="${START_BR}"; \
-          while /bin/true; do \
-            BR=$(read_branch_config "${BR}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
-                 /bin/awk '/^[ \t]*NEXT/{ print $3 }'); \
-            [ -z "${BR}" -o "${BR}" = 'none' -o "${BR}" = 'master' ] && break; \
-            printf '%s ' "${BR}"; \
-            [ "${BR}" = "${STOP_AT_BRANCH}" ] && break; \
-          done)
-if [ -s "${BRANCH_CONFIG_FAILURE_FILE}" ]; then
-  /bin/rm -f "${BRANCH_CONFIG_FAILURE_FILE}"
-  printf '\n\tCannot read config file for some branch:\n\t%s !\n' \
-         'try "git align-branches" first' >&2
-  exit 4
-fi
-MATCHED=${MATCHED% }
-LAST_BRANCH=${MATCHED##* }
-[ -z "${LAST_BRANCH}" ] && LAST_BRANCH="${START_BR}"
-NEXT_OF_LAST=$(read_branch_config "${LAST_BRANCH}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
-               /bin/awk '/^[ \t]*NEXT/{ print $3 }');
-unset UPDATE_MASTER_BRANCH
-if [ "${NEXT_OF_LAST}" = 'master' ]; then
-  UPDATE_MASTER_BRANCH=1
-fi
-unset LAST_BRANCH NEXT_OF_LAST
-
-CURRENT=$(read_branch_config "${START_BR}" "${BRANCH_CONFIG_FAILURE_FILE}" | \
-          /bin/awk '/^[ \t]*CURRENT/{ print $3 }')
-/bin/rm -f "${BRANCH_CONFIG_FAILURE_FILE}"
-
-if [ -z "${BACKWARD_TO}" ]; then
-  # Check for (local) user's branch ...
-  if [ "${ACTIVE}" != "${CURRENT}" ]; then
-    printf 'WARNING: current branch "%s" appears to be a sub-branch of "%s".\n' \
-           "${ACTIVE}" "${CURRENT}" >&2
-    ask_for_confirmation "Do you want to merge '${ACTIVE}' into '${CURRENT}' ?" \
-                         '-force'
-    if [ $? -eq 0 ]; then # Answer is 'Y'
-      MATCHED="${CURRENT} ${MATCHED}"
-    else # Answer is 'N'
-      printf 'Command aborted as requested.\n'
-      exit 0
-    fi
-  fi
-fi
-
-if [ "${BACKWARD_TO}" ]; then
-  Info "Cherry-picking last commit into branch '${BACKWARD_TO}'"
-  COMMIT_ID=$(git --no-pager log -1 --pretty=format:%H)
-  SHORT_COMMIT=$(echo "${COMMIT_ID}" | /usr/bin/cut -c1-7)
-  ask_for_confirmation "Do you want to cherry-pick commit '${SHORT_COMMIT}' ?" \
-                       '-force'
-  if [ $? -eq 0 ]; then # Answer is 'Y'
-    SubInfo "Running 'git checkout ${BACKWARD_TO}'"
-    git checkout "${BACKWARD_TO}"
-    SubInfo "Running 'git cherry-pick'"
-    git cherry-pick --no-commit "${COMMIT_ID}"
-    SubInfo "Showing 'git status'"
-    ${RUN} git status -uno
-    SubInfo "Running 'git mergetool' if needed"
-    ${RUN} git mergetool
-    SubInfo "Running 'git commit' to conclude merge"
-    run_git_commit "cherry-pick of ${SHORT_COMMIT} (${MSG})"
-  else # Answer is 'N'
-    printf 'Command aborted as requested.\n'
-    exit 0
-  fi
-fi
-
-if [ -z "${MATCHED}" ]; then
-  Info "No next branch to merge"
-  ask_for_confirmation 'Do you want to push current branch ?' '-force'
-  if [ $? -eq 0 ]; then # Answer is 'Y'
-    SubInfo "Running 'git push'"
-    ${RUN} git push
-    if [ $? -ne 0 ]; then
-      SubInfo "Push failed: trying a 'git pull' first"
-      ${RUN} git pull --no-commit
-      SubInfo "Commiting the pull merge"
-      REMOTE=$(git remote -v | \
-               /bin/awk '/(fetch)/{ sub("^.*@",""); sub("\\..*",""); print }')
-      run_git_commit "Merge remote branch ${ACTIVE} of ${REMOTE} into ${ACTIVE} (${MESSAGE})"
-      SubInfo "Running 'git push' again"
-      ${RUN} git push
-    fi
-
-    if [ "${UPDATE_MASTER_BRANCH}" ]; then
-      BR='master'
-      SubInfo "Fast-forwarding '${ACTIVE}' --> '${BR}'"
-      git_ff_merge "${BR}" "${ACTIVE}"
-      if [ $? -eq 0 ]; then
-        SubInfo "Running 'git push ${BR}'"
-        ${RUN} git push origin "${BR}"
-      fi
-    fi
-  else # Answer is 'N'
-    printf "Manually run '[1;7m%s[m'\n" 'git push'
-  fi
-else
-  Info "Pulling branches from remote repository"
-  SubInfo "Running 'git align-branches ${MATCHED}'"
-  ${RUN} git align-branches ${MATCHED}
-  if [ $? -ne 0 ]; then
-    printf '\n\tERROR: git align-branches failed !\n\n' >&2
-    exit 1
-  fi
-
-  PREV=${ACTIVE}
-  for BR in ${MATCHED}; do
-    unset MERGE_OPT
-    MERGE_TYPE='Merg'
-    if [ "${BR}" = "${STOP_AT_BRANCH}" ]; then
-       MERGE_OPT=" -${STOP_AT_FLAG} ours"
-       MERGE_TYPE='(No)merg'
-    fi
-    Info "${MERGE_TYPE}ing '${PREV}' --> '${BR}'[33m${MERGE_OPT}[30m"
-    do_git_merge "${BR}" "${PREV}" "${MESSAGE}" "${MERGE_TYPE}" "${MERGE_OPT}"
-    #[ "${BR}" = "${STOP_AT_BRANCH}" ] && break
-    PREV="${BR}"
-  done
-  if [ -z "${STOP_AT_BRANCH}" -a "${UPDATE_MASTER_BRANCH}" ]; then
-    BR='master'
-    Info "Fast-forwarding '${PREV}' --> '${BR}'"
-    git_ff_merge "${BR}" "${PREV}"
-  fi
-
-  FINAL_OR_ORIGINAL='final'
-  if [ -z "${FINAL_BRANCH}" ]; then
-    FINAL_BRANCH="${ACTIVE}"
-    FINAL_OR_ORIGINAL='original'
-  fi
-  Info "Reverting back to ${FINAL_OR_ORIGINAL} branch '${FINAL_BRANCH}'"
-  SubInfo "Running 'git checkout ${FINAL_BRANCH}'"
-  ${RUN} git checkout ${FINAL_BRANCH}
-
-  Info "Pushing all branches to remote repository"
-  printf '\nYou shall now push all changed branches to the remote repository.\n'
-  ask_for_confirmation 'Proceed with push ?' '-force'
-  if [ $? -eq 0 ]; then # Answer is 'Y'
-    SubInfo "Running 'git align-branches --push ${ACTIVE} ${MATCHED}'"
-    ${RUN} git align-branches --push ${ACTIVE} ${MATCHED}
-    if [ $? -ne 0 ]; then
-      printf '\n\tERROR: git align-branches --push failed !\n\n' >&2
-      exit 5
-    fi
-
-    if [ -z "${STOP_AT_BRANCH}" -a "${UPDATE_MASTER_BRANCH}" ]; then
-      BR='master'
-      SubInfo "Fast-forwarding '${PREV}' --> '${BR}' again"
-      git_ff_merge "${BR}" "${PREV}"
-      if [ $? -eq 0 ]; then
-        SubInfo "Running 'git push ${BR}'"
-        ${RUN} git push origin "${BR}"
-      fi
-    fi
-  else # Answer is 'N'
-    printf "Manually run '[1;7m%s[m'\n" \
-           "git align-branches --push ${ACTIVE} ${MATCHED}"
-  fi
-fi
+#==============================================================================
+#==============================================================================

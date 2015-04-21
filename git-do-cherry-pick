@@ -1,19 +1,16 @@
-#!/usr/local/bin/perl -w
+#!/usr/bin/env perl
 #------------------------------------------------------------------------------
 # $Id$
 #------------------------------------------------------------------------------
 
+use warnings;
 use strict;
 
 use constant TRUE  => (1 == 1);
 use constant FALSE => (! TRUE);
 
 use Getopt::Long;
-use IO::Handle;
 #use Data::Dumper;
-
-use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
-use GitCmd;
 
 # Only default values different from FALSE must be listed here ...
 my %OPTIONS = ( interact => TRUE );
@@ -33,102 +30,64 @@ my %COLORS = (
 
   # Here $git_r (R for "real") ALWAYS invokes the various git commands,
   # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
-  # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
-  my $git_r = new GitCmd( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  # Finally $git_rs and $git_ds (S for "safe") are like $git_r and $git_d 
+  # respectively, but do not fail on errors.
+  my $git_r = new GitDoPick( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
   my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
-  my $git_s = $git_d->new( stopOnErrors => FALSE );
+  my $git_rs = $git_r->new( stopOnErrors => FALSE );
+  my $git_ds = $git_d->new( stopOnErrors => FALSE );
 
-  my $curr_br = &CurrentBranch( $git_r );
+  my $curr_br = $git_r->CurrentBranch;
+
   my @hash_to_cherry_pick = ();
   foreach my $commit (@commits_to_cherry_pick) {
-    my $short_hash = &GitShortHash( $git_r, $commit );
+    my $short_hash = $git_rs->AbbrevHash( $commit );
     push( @hash_to_cherry_pick, $short_hash );
   }
-
   my $commits_list = join( "', '", @hash_to_cherry_pick );
-  &Info( "Cherry-picking commits '$commits_list' on top of '$curr_br'" );
-  $git_s->cherry_pick( @cherry_pick_opts, @hash_to_cherry_pick );
-  while ( $git_s->KO ) {
-    my $abort_cherry_pick = &ResolveConflicts( $git_r, $git_d, $git_s );
-    if ( $abort_cherry_pick ) {
+  my $s = ( ($#hash_to_cherry_pick > 0) ? 's' : '' );
+
+  my $add_x_opt = TRUE;
+  foreach my $hash (@hash_to_cherry_pick) {
+    my @upstr = $git_r->ContainingUpstreamBranches( $hash );
+    if ( $#upstr < 0 ) { $add_x_opt = FALSE; last; }
+  } # END foreach
+  push( @cherry_pick_opts, '-x' ) if ( $add_x_opt );
+
+  &Info( "Cherry-picking commit$s '$commits_list' on top of '$curr_br'" );
+  $git_ds->cherry_pick( @cherry_pick_opts, @hash_to_cherry_pick );
+  while ( $git_ds->KO ) {
+    my @opts = ();
+    push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
+    push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+    push( @opts, '--pretty' ) if ( $OPTIONS{pretty} );
+    push( @opts, '--nointeract' ) unless ( $OPTIONS{interact} );
+    push( @opts, '--edit' ) if ( $OPTIONS{edit} );
+    # Here we use "$git_rs" since we also pass "--dryrun" option (if present)
+    $git_rs->resolve_conflicts( @opts );
+    if ( $git_rs->KO ) {
       &Info( "Running 'git cherry-pick --abort' to undo the cherry-pick" );
       $git_d->cherry_pick( '--abort' );
       exit 1;
     }
 
     print "\nYou can now either:\n",
-         " - $COLORS{B}continue$COLORS{N} the cherry-pick process\n",
-         " - $COLORS{B}skip$COLORS{N} this commit and continue with next one\n",
-         " - $COLORS{B}abort$COLORS{N} the whole cherry-pick process.\n";
+          " - $COLORS{B}continue$COLORS{N} the cherry-pick process\n",
+          " - $COLORS{B}abort$COLORS{N} the whole cherry-pick process.\n";
     my $ans = &AskConfirmation( 'Continue with cherry-pick ?', TRUE );
     if ( $ans ) { # i.e. answer is 'Y'
+#git commit --reuse-message=<commit>
       &Info( "Running 'git cherry-pick --continue' to resume the process" );
-      $git_s->cherry_pick( '--continue' );
+      $git_ds->cherry_pick( '--continue' );
     } else {
-      $ans = &AskConfirmation( 'Skip commit and continue ?', TRUE );
-      if ( $ans ) { # i.e. answer is 'Y'
-        &Info( "Running 'git cherry-pick --skip' to proceed with next commit" );
-        $git_d->cherry_pick( '--skip' );
-      } else {
-        print "OK, aborting.\n";
-        &Info( "Running 'git cherry-pick --abort' to undo the cherry-pick" );
-        $git_d->cherry_pick( '--abort' );
-        exit 2;
-      }
+      print "OK, aborting.\n";
+      &Info( "Running 'git cherry-pick --abort' to undo the cherry-pick" );
+      $git_d->cherry_pick( '--abort' );
+      exit 2;
     }
   } # END while
 
 } # -----[ main ]-----
-
-#==============================================================================
-
-sub ResolveConflicts {
-  # ----- Function arguments -----
-  my( $git_r, $git_d, $git_s ) = @_;
-  # ----- Local variables -----
-  my $abort_cherry_pick = FALSE;
-  # ----- Function code -----
-  &Info( "Running 'git mergetool' to resolve conflicts" );
-  $git_s->mergetool;
-
-  my $edit_files = $git_s->KO || $OPTIONS{edit};
-
-  my( $output, $modified, $conflicts ) = &ParseGitStatus( $git_r );
-
-  if ( ! $edit_files ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-    $output = undef; # To avoid showing it again below
-    if ( $#{$conflicts} >= 0 ) {
-      $edit_files = &AskConfirmation( 'Do you want to edit merged files ?',
-                                      FALSE );
-    }
-  }
-
-  if ( $edit_files ) {
-    my $editor = $git_r->var( 'GIT_EDITOR' );
-    $editor = "echo $editor" if ( $OPTIONS{dryrun} );
-    foreach my $file (@{$conflicts}) {
-      system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
-    } # END foreach
-
-    my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
-    $git_d->add( @{$conflicts} ) if ( $ans );
-
-    ( $output, $modified, $conflicts ) = &ParseGitStatus( $git_d );
-  }
-
-  if ( defined($output) ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-  }
-  if ( $#{$conflicts} >= 0 ) {
-    print "\nThere are still unresolved conflicts! Abort forced.\n";
-    $abort_cherry_pick = TRUE;
-  }
-  # ----- Return value -----
-  $abort_cherry_pick;
-}
 
 #==============================================================================
 
@@ -183,40 +142,6 @@ sub ManageOptions {
 
 #==============================================================================
 
-sub CurrentBranch {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Function code -----
-  my $current = $git->symbolic_ref( 'HEAD' );
-  $current =~ s!^refs/heads/!!;
-  # ----- Return value -----
-  $current;
-}
-
-#==============================================================================
-
-sub ParseGitStatus {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Local variables -----
-  my $output = ();
-  my @modified = ();
-  my @conflicts = ();
-  my $fh = new IO::Handle;
-  # ----- Function code -----
-  $git->status( $fh, '--untracked-files=no' );
-  while ( my $line = <$fh> ) {
-    $output .= $line;
-    push( @modified, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
-    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
-  }
-  $git->Close( $fh );
-  # ----- Return value -----
-  ( $output, \@modified, \@conflicts );
-}
-
-#==============================================================================
-
 sub Info {
   print "\t$COLORS{I}$COLORS{S}@_ ...$COLORS{S}$COLORS{N}\n";
 }
@@ -240,16 +165,41 @@ sub AskConfirmation {
   } # END while
 }
 
+#==============================================================================
+#==============================================================================
+
+package GitDoPick;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
 #------------------------------------------------------------------------------
 
-sub GitShortHash {
+sub CurrentBranch {
+  # ----- Local variables -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#------------------------------------------------------------------------------
+
+# N.B.: assumes $self->{stopOnErrors} is FALSE !!!
+sub AbbrevHash {
   # ----- Function arguments -----
-  my( $git_r, $ref ) = @_;
+  my( $self, $ref ) = @_;
   # ----- Function code -----
   my $short_hash;
-  my $git_s = $git_r->new( stopOnErrors => FALSE );
-  my @hashes = $git_s->show_ref( '--hash=7', "'$ref'" );
-  if ( $git_s->KO ) { 
+  my @hashes = $self->show_ref( '--hash=7', "'$ref'" );
+  if ( $self->KO ) { 
     ( $short_hash ) = ( $ref =~ /^(\w{7})/ );
   } else {
     $short_hash = $hashes[0];
@@ -258,4 +208,48 @@ sub GitShortHash {
   $short_hash;
 }
 
+#------------------------------------------------------------------------------
+
+sub UpstreamBranch {
+  # ----- Function arguments -----
+  my( $self, $branch ) = @_;
+  # ----- Return value -----
+  $self->rev_parse( '--abbrev-ref', "$branch\@{upstream}", '2>/dev/null' );
+}
+
+#------------------------------------------------------------------------------
+
+# N.B.: assumes $self->{stopOnErrors} is FALSE !!!
+sub ContainingUpstreamBranches {
+  # ----- Function arguments -----
+  my( $self, $commit ) = @_;
+  # ----- Function code -----
+  my @branches = $self->branch( '--contains', $commit, '2>/dev/null' );
+  @branches = () if ( $self->KO ); # Probably redundant ...
+  my @upstreams = ();
+  foreach my $br (@branches) {
+    my $upstr = $self->UpstreamBranch( $br );
+    push( @upstreams, $upstr ) unless ( $self->KO );
+  } # END foreach
+  # ----- Return value -----
+  @upstreams;
+}
+
+#------------------------------------------------------------------------------
+
+sub CherryPickInProgress {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $git_dir = $self->rev_parse( '--git-dir' );
+  # ----- Return value -----
+  -f "$git_dir/CHERRY_PICK_HEAD";
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
 #==============================================================================

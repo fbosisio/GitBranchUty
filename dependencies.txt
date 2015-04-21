@@ -1,0 +1,14 @@
+
+ promote --+--> branch-order --+--> seq-branch-dotted
+           |                   `--> seq-branch-config
+           |
+           +--> seq-merge ----+-------------.
+           |                  |             |
+           |                  v             v
+           +--------------> synch --+--> do-merge ---------.
+           |                        |                      |
+           |                        |                      v
+           |                        `--> do-rebase --> resolve-conflicts
+           |                                               ^
+           `--> ff-merge                                   |
+                                         do-cherry-pick ---'

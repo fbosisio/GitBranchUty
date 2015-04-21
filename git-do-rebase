@@ -1,19 +1,16 @@
-#!/usr/local/bin/perl -w
+#!/usr/bin/env perl
 #------------------------------------------------------------------------------
 # $Id$
 #------------------------------------------------------------------------------
 
+use warnings;
 use strict;
 
 use constant TRUE  => (1 == 1);
 use constant FALSE => (! TRUE);
 
 use Getopt::Long;
-use IO::Handle;
 #use Data::Dumper;
-
-use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
-use GitCmd;
 
 # Only default values different from FALSE must be listed here ...
 my %OPTIONS = ( interact => TRUE );
@@ -33,18 +30,27 @@ my %COLORS = (
 
   # Here $git_r (R for "real") ALWAYS invokes the various git commands,
   # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
-  # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
-  my $git_r = new GitCmd( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  # Finally $git_rs and $git_ds (S for "safe") are like $git_r and $git_d 
+  # respectively, but do not fail on errors.
+  my $git_r = new GitDoRebase( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
   my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
-  my $git_s = $git_d->new( stopOnErrors => FALSE );
+  my $git_rs = $git_r->new( stopOnErrors => FALSE );
+  my $git_ds = $git_d->new( stopOnErrors => FALSE );
 
-  my $curr_br = &CurrentBranch( $git_r );
+  my $curr_br = $git_r->CurrentBranch;
 
   &Info( "Rebasing branch '$curr_br' on top of '$br_to_rebase'" );
-  $git_s->rebase( $br_to_rebase, @rebase_opts );
-  while ( $git_s->KO ) {
-    my $abort_rebase = &ResolveConflicts( $git_r, $git_d, $git_s );
-    if ( $abort_rebase ) {
+  $git_ds->rebase( $br_to_rebase, @rebase_opts );
+  while ( $git_ds->KO ) {
+    my @opts = ();
+    push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
+    push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
+    push( @opts, '--pretty' ) if ( $OPTIONS{pretty} );
+    push( @opts, '--nointeract' ) unless ( $OPTIONS{interact} );
+    push( @opts, '--edit' ) if ( $OPTIONS{edit} );
+    # Here we use "$git_rs" since we also pass "--dryrun" option (if present)
+    $git_rs->resolve_conflicts( @opts );
+    if ( $git_rs->KO ) {
       &Info( "Running 'git rebase --abort' to undo the rebase" );
       $git_d->rebase( '--abort' );
       exit 1;
@@ -57,7 +63,7 @@ my %COLORS = (
     my $ans = &AskConfirmation( 'Continue with rebase ?', TRUE );
     if ( $ans ) { # i.e. answer is 'Y'
       &Info( "Running 'git rebase --continue' to resume the process" );
-      $git_s->rebase( '--continue' );
+      $git_ds->rebase( '--continue' );
     } else {
       $ans = &AskConfirmation( 'Skip commit and continue ?', TRUE );
       if ( $ans ) { # i.e. answer is 'Y'
@@ -73,56 +79,6 @@ my %COLORS = (
   } # END while
 
 } # -----[ main ]-----
-
-#==============================================================================
-
-sub ResolveConflicts {
-  # ----- Function arguments -----
-  my( $git_r, $git_d, $git_s ) = @_;
-  # ----- Local variables -----
-  my $abort_rebase = FALSE;
-  # ----- Function code -----
-  &Info( "Running 'git mergetool' to resolve conflicts" );
-  $git_s->mergetool;
-
-  my $edit_files = $git_s->KO || $OPTIONS{edit};
-
-  my( $output, $modified, $conflicts ) = &ParseGitStatus( $git_r );
-
-  if ( ! $edit_files ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-    $output = undef; # To avoid showing it again below
-    if ( $#{$conflicts} >= 0 ) {
-      $edit_files = &AskConfirmation( 'Do you want to edit merged files ?',
-                                      FALSE );
-    }
-  }
-
-  if ( $edit_files ) {
-    my $editor = $git_r->var( 'GIT_EDITOR' );
-    $editor = "echo $editor" if ( $OPTIONS{dryrun} );
-    foreach my $file (@{$conflicts}) {
-      system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
-    } # END foreach
-
-    my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
-    $git_d->add( @{$conflicts} ) if ( $ans );
-
-    ( $output, $modified, $conflicts ) = &ParseGitStatus( $git_d );
-  }
-
-  if ( defined($output) ) {
-    &Info( "Showing 'git status'" );
-    print $output;
-  }
-  if ( $#{$conflicts} >= 0 ) {
-    print "\nThere are still unresolved conflicts! Abort forced.\n";
-    $abort_rebase = TRUE;
-  }
-  # ----- Return value -----
-  $abort_rebase;
-}
 
 #==============================================================================
 
@@ -177,40 +133,6 @@ sub ManageOptions {
 
 #==============================================================================
 
-sub CurrentBranch {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Function code -----
-  my $current = $git->symbolic_ref( 'HEAD' );
-  $current =~ s!^refs/heads/!!;
-  # ----- Return value -----
-  $current;
-}
-
-#==============================================================================
-
-sub ParseGitStatus {
-  # ----- Local variables -----
-  my( $git ) = @_;
-  # ----- Local variables -----
-  my $output = ();
-  my @modified = ();
-  my @conflicts = ();
-  my $fh = new IO::Handle;
-  # ----- Function code -----
-  $git->status( $fh, '--untracked-files=no' );
-  while ( my $line = <$fh> ) {
-    $output .= $line;
-    push( @modified, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
-    push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
-  }
-  $git->Close( $fh );
-  # ----- Return value -----
-  ( $output, \@modified, \@conflicts );
-}
-
-#==============================================================================
-
 sub Info {
   print "\t$COLORS{I}$COLORS{S}@_ ...$COLORS{S}$COLORS{N}\n";
 }
@@ -234,4 +156,47 @@ sub AskConfirmation {
   } # END while
 }
 
+#==============================================================================
+#==============================================================================
+
+package GitDoRebase;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub CurrentBranch {
+  # ----- Local variables -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#------------------------------------------------------------------------------
+
+sub RebaseInProgress {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $git_dir = $self->rev_parse( '--git-dir' );
+  # ----- Return value -----
+  ##-f "$git_dir/REBASE_HEAD";
+  -d "$git_dir/rebase-merge" or -d "$git_dir/rebase-apply";
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
 #==============================================================================

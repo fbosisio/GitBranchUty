@@ -1,0 +1,174 @@
+#!/usr/bin/env perl
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use warnings;
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+use Getopt::Long;
+
+# Only default values different from FALSE must be listed here ...
+my %OPTIONS = ( interact => TRUE );
+
+my %COLORS = (
+  I => '[33;40m',
+  B => '[30;42m',
+  N => '[m',
+  S => ' '
+);
+
+{ # -----[ main ]-----
+
+  &ManageOptions();
+
+  # Here $git_r (R for "real") ALWAYS invokes the various git commands,
+  # whereas $git_d (D for "dryrun") obeys the "--dryrun" option (run or print).
+  # Finally $git_s (S for "safe") obeys "--dryrun" and does not fail on errors.
+  my $git_r = new GitResConfl( verbose => ( $OPTIONS{verbose} ? 1 : 0 ) );
+  my $git_d = $git_r->new( printOnly => $OPTIONS{dryrun} );
+  my $git_s = $git_d->new( stopOnErrors => FALSE );
+
+  &Info( "Running 'git mergetool' to resolve conflicts" );
+  $git_s->mergetool;
+
+  my $edit_files = $git_s->KO || $OPTIONS{edit};
+
+  my( $output, $merged, $conflicts ) = $git_r->ParseStatus;
+
+  if ( ! $edit_files ) {
+    &Info( "Showing 'git status'" );
+    print $output;
+    $output = undef; # To avoid showing it again below
+    if ( $#{$conflicts} >= 0 ) {
+      $edit_files = &AskConfirmation( 'Do you want to edit merged files ?',
+                                      FALSE );
+    }
+  }
+
+  if ( $edit_files ) {
+    my $editor = $git_r->var( 'GIT_EDITOR' );
+    $editor = "echo $editor" if ( $OPTIONS{dryrun} );
+    foreach my $file (@{$conflicts}) {
+      print "Opening editor ('$editor') on '$file' as requested ...\n";
+      system( "$editor $file" ) == 0 or warn "WARNING: failed to edit '$file'.";
+    } # END foreach
+
+    my $ans = &AskConfirmation( 'Was editing OK ?', TRUE );
+    $git_d->add( @{$conflicts} ) if ( $ans );
+
+    ( $output, $merged, $conflicts ) = $git_d->ParseStatus;
+  }
+
+  if ( defined($output) ) {
+    &Info( "Showing 'git status'" );
+    print $output;
+  }
+  if ( $#{$conflicts} >= 0 ) {
+    print "\nThere still are unresolved conflicts! Abort forced.\n";
+    exit 1;
+  }
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub ManageOptions {
+  # ----- Function code -----
+  &GetOptions( \%OPTIONS,
+               'verbose|v',
+               'dryrun|dry-run|n',
+               'pretty',
+               'interact!',
+               'edit|e',
+               'help|h|?' ) or die "ERROR: option parsing failed!\n";
+
+  if ( $OPTIONS{help} ) {
+    my( $program_name ) = ( $0 =~ m!([^/]+)$! );
+    $program_name =~ s/^(git)-/$1 /;
+    my $indent_space = ' ' x length($program_name);
+    print STDERR "
+  USAGE: $program_name [-v|--verbose] [-n|--dry[-]run] [--pretty]
+         $indent_space [--no[-]interact] [-e|--edit]
+         --verbose    : print each underlying git command before execution
+         --dryrun     : just print git commands, but do not execute them
+         --pretty     : use ANSI colors to highlight step messages
+         --nointeract : avoid asking confirmations (assume everything OK)
+         --edit       : force editing of files with conflicts (normally
+                        this only happens if 'mergetool' fails).\n\n";
+    exit 0;
+  }
+
+  $COLORS{I} = $COLORS{B} = $COLORS{N} = $COLORS{S} = '' unless ( $OPTIONS{pretty} );
+}
+
+#==============================================================================
+
+sub Info {
+  print "\t$COLORS{I}$COLORS{S}@_ ...$COLORS{S}$COLORS{N}\n";
+}
+
+#==============================================================================
+
+sub AskConfirmation {
+  # ----- Function arguments -----
+  my( $msg, $default ) = @_;
+  # ----- Function code -----
+  return $default unless ( $OPTIONS{interact} );
+  while ( TRUE ) {
+    printf '%s [Y/N] » ', $msg;
+    if ( $OPTIONS{dryrun} ) {
+      print '', ($default ? 'Y' : 'N'), " [dryrun]\n";
+      return $default;
+    }
+    chomp( my $answer = <STDIN> );
+    return TRUE  if ( $answer =~ /^y$/i );
+    return FALSE if ( $answer =~ /^n$/i );
+  } # END while
+}
+
+#==============================================================================
+#==============================================================================
+
+package GitResConfl;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub ParseStatus {
+  # ----- Local variables -----
+  my( $self ) = @_;
+  # ----- Local variables -----
+  my $output = ();
+  my @merged = ();
+  my @conflicts = ();
+  my $fh = new IO::Handle;
+  # ----- Function code -----
+  $self->status( $fh, '--untracked-files=no' );
+    while ( my $line = <$fh> ) {
+      $output .= $line;
+      push( @merged, $1 ) if ( $line =~ /(?:modified|new file):\s+(\S.+)/ );
+      push( @conflicts, $1 ) if ( $line =~ /both modified:\s+(\S.+)/ );
+    }
+  $self->Close( $fh );
+  # ----- Return value -----
+  ( $output, \@merged, \@conflicts );
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
+#==============================================================================

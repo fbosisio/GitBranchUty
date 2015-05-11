@@ -127,7 +127,7 @@ sub AbortMerge {
     &Info( "Undoing merge with 'git merge --abort'" );
     $git_d->merge( '--abort' );
     &Info( "Re-showing 'git status'" );
-    $git_d->status;
+    $git_d->status( '--untracked-files=no' );
   } else {  # Answer is 'N'
     print "\nWARNING: leaving the merge pending as requested !\n" .
           "\t (complete with \"git commit\" or undo with \"git merge --abort\")\n\n";

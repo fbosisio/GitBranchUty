@@ -1,0 +1,138 @@
+#!/usr/bin/env perl
+#------------------------------------------------------------------------------
+# $Id$
+#------------------------------------------------------------------------------
+
+use warnings;
+use strict;
+
+use constant TRUE  => (1 == 1);
+use constant FALSE => (! TRUE);
+
+{ # -----[ main ]-----
+
+  # N.B.: this is a SAFE git instance (it won't stop on errors)
+  my $git = new GitStartBr( stopOnErrors => FALSE );
+
+  my $curr_br = $ARGV[0] || $git->CurrentBranch;
+
+  my $upstr = $git->UpstreamBranch( $curr_br );
+  unless ( $git->KO ) {
+    print "Branch '$curr_br' is tracking '$upstr'.\n";
+    exit 0;
+  }
+
+  my @tracked = $git->TrackedBranches;
+  my( $nearest, $forw_dist ) = &GitNearestBranches( $git, $curr_br, \@tracked, TRUE );
+  my( $candidates, $rev_dist ) = &GitNearestBranches( $git, $curr_br, $nearest, FALSE );
+
+  if ( $#{$candidates} == 0 ) {
+    my $branch = $candidates->[0];
+    print "Branch '$curr_br' seems a sub-branch of '$branch' (divereged by $forw_dist and $rev_dist commits).\n";
+  } elsif ( $#{$candidates} > 0 ) {
+    print "Candidates parent branches for '$curr_br' are:\n\t",
+          join("\n\t",@{$candidates}), "\n";
+  } else {
+    print "No parent branch found for '$curr_br' !\n";
+  }
+
+} # -----[ main ]-----
+
+#==============================================================================
+
+sub GitNearestBranches {
+  # ----- Function arguments -----
+  my( $git, $curr_br, $branches, $direct ) = @_;
+  # ----- Local variables -----
+  my $min_dist = 1000000;
+  my @near_branches = ();
+  # ----- Function code -----
+  foreach my $br (@{$branches}) {
+    next if ( $br eq $curr_br );
+    my @args = ( $direct ? ($br,$curr_br) : ($curr_br,$br) );
+#    print "Checking distance between '", join("' and '",@args), "' ...\n";
+    my $distance = $git->BranchDistance( @args );
+    if ( $distance < $min_dist ) {
+      $min_dist = $distance;
+      @near_branches = ( $br ); # Reset list
+    } elsif ( $distance == $min_dist ) {
+      push( @near_branches, $br ); # Append to list
+    }
+  } # END foreach
+  # ----- Return value -----
+  ( \@near_branches, $min_dist );
+}
+
+#==============================================================================
+#==============================================================================
+
+package GitStartBr;
+
+use IO::Handle;
+
+use lib ( __FILE__ =~ m!^(.*)/[^\/]+$! );  # Next module can be in same dir
+use base 'GitCmd';
+
+use constant TRUE  => GitCmd::TRUE;
+use constant FALSE => GitCmd::FALSE;
+
+#------------------------------------------------------------------------------
+
+sub UpstreamBranch {
+  # ----- Function arguments -----
+  my( $self, $branch ) = @_;
+  # ----- Return value -----
+  $self->rev_parse( '--abbrev-ref', "$branch\@{upstream}", '2>/dev/null' );
+}
+
+#------------------------------------------------------------------------------
+
+# The logic of this routine is based on the shell script found at:
+# http://stackoverflow.com/questions/4950725/how-do-i-get-git-to-show-me-which-branches-are-tracking-what
+sub TrackedBranches {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Local variables -----
+  my @tracked = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $self->for_each_ref( $fh, "--format='%(refname:short)'", 'refs/heads' );
+    while ( my $br = <$fh> ) {
+      chomp( $br );
+      my $upstr = $self->UpstreamBranch( $br );
+      next if ( $self->KO );
+      push( @tracked, $br );
+    }
+  $self->Close( $fh );
+  # ----- Return value -----
+  @tracked;
+}
+
+#------------------------------------------------------------------------------
+
+sub CurrentBranch {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Function code -----
+  my $current = $self->symbolic_ref( 'HEAD' );
+  $current =~ s!^refs/heads/!!;
+  # ----- Return value -----
+  $current;
+}
+
+#------------------------------------------------------------------------------
+
+sub BranchDistance {
+  # ----- Function arguments -----
+  my( $self, $branch_1, $branch_2 ) = @_;
+  # ----- Return value -----
+  $self->rev_list( '--count', "'$branch_1'..'$branch_2'" );
+}
+
+#------------------------------------------------------------------------------
+
+# module return code
+TRUE;
+
+#==============================================================================
+#==============================================================================

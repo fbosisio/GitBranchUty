@@ -50,24 +50,6 @@ my %COLORS = (
 
   my $start_br = $git->CurrentBranch;
 
-  if ( ! $OPTIONS{message} ) {
-    my $commit = $start_br;
-    if ( $OPTIONS{continue} ) {
-      &Info( 'Resuming previous invocation' );
-      $OPTIONS{continue} = $commit = $git->NonMergeAncestor( $start_br );
-      die "No previous invocation to resume !\n" if ( $commit eq $start_br );
-    }
-    my $msg = $git->log( '-1', '--pretty=%s', $commit );
-    $msg =~ s/\s+\(cherry picked from commit [a-f\d]+\)//; # Drop cherry-pick
-    print "The following commit-message will be used:\n",
-          "$COLORS{B}$msg$COLORS{N}\n";
-    unless ( $OPTIONS{continue} ) {
-      my $ok = &AskConfirmation( 'Do you confirm the commit message ?', TRUE );
-      exit 1 unless ( $ok ); # Answer is 'N'
-    }
-    $OPTIONS{message} = $msg;
-  }
-
   if ( $^O eq 'msys' ) { # Only on WIN
     # Apparently, it seems that sometimes this command has problems when
     # run automatically instead of explicitly ... (but only on this OS)
@@ -88,12 +70,35 @@ my %COLORS = (
   # Remove first branch from list, if it is the current one
   shift @branch_list if ( $#branch_list >= 0 && $branch_list[0] eq $start_br );
 
+  if ( $OPTIONS{continue} ) {
+    &Info( 'Resuming previous invocation' );
+    my $commit = $OPTIONS{continue} = $git->NonMergeAncestor( $start_br );
+    die "No previous invocation to resume !\n" if ( $commit eq $start_br );
+  }
+
+  unless ( $OPTIONS{message} || ( $#branch_list == 0 ) ) {
+    my $commit = ( $OPTIONS{continue} ? $OPTIONS{continue} : $start_br );
+    my $msg = $git->log( '-1', '--pretty=%s', $commit );
+    $msg =~ s/\s+\(cherry picked from commit [a-f\d]+\)//; # Drop cherry-pick
+    print "The following commit-message will be used:\n",
+          "$COLORS{B}$msg$COLORS{N}\n";
+    unless ( $OPTIONS{continue} ) {
+      my $ok = &AskConfirmation( 'Do you confirm the commit message ?', TRUE );
+      exit 1 unless ( $ok ); # Answer is 'N'
+    }
+    $OPTIONS{message} = $msg;
+  }
+
   my @from_prev_run = ();
   if ( $OPTIONS{continue} ) {
     &Info( 'Retrieving branches managed in previous invocation' );
     &BranchesFromPreviousRun( $git, $OPTIONS{continue}, $start_br,
                               \@branch_list, \@from_prev_run );
-    print "No branch processed in previous run.\n" if ( $#from_prev_run < 0 );
+    if ( $#from_prev_run < 0 ) {
+      print "No branch processed in previous run.\n";
+    } else {
+      print "Adding branches '", join("', '",@from_prev_run), "' ...\n";
+    }
   }
 
   if ( exists($OPTIONS{'already-in'}) || exists($OPTIONS{'skip-from'}) ) {
@@ -142,6 +147,11 @@ my %COLORS = (
   if ( $#from_prev_run >= 0 ) {
     &Info( 'Pushing branches from previous run (', join(', ',@from_prev_run), ')' );
     $git->synch( @opts, '--mode=push', @from_prev_run ); # $git --dryrun(?)
+    if ( $OPTIONS{restore} ) {
+      my $prev_start = $from_prev_run[0];
+      &Info( "Reverting back to previous original branch ($prev_start)" );
+      $git->new( printOnly => $OPTIONS{dryrun} )->checkout( $prev_start );
+    }    
   }
 
   if ( defined($update_master) ) {

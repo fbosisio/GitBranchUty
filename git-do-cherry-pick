@@ -49,7 +49,7 @@ my %COLORS = (
 
   my $add_x_opt = TRUE;
   foreach my $hash (@hash_to_cherry_pick) {
-    my @upstr = $git_r->ContainingUpstreamBranches( $hash );
+    my @upstr = $git_rs->ContainingUpstreamBranches( $hash );
     if ( $#upstr < 0 ) { $add_x_opt = FALSE; last; }
   } # END foreach
   push( @cherry_pick_opts, '-x' ) if ( $add_x_opt );

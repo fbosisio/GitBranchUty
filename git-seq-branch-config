@@ -26,11 +26,13 @@ use GitCmd;
   }
 
   my $git = new GitCmd;
+  my $safe_git = $git->new( stopOnErrors => FALSE );
 
   # Get remote-tracking branch for given branch
-  my $remote = $git->rev_parse( '--abbrev-ref', "$start_br\@{upstream}",
-                                '2>/dev/null' );
+  my $remote = $safe_git->rev_parse( '--abbrev-ref', "$start_br\@{upstream}",
+                                     '2>/dev/null' );
   $remote =~ s!/$start_br$!!; # Extract the name of the remote
+  die "Branch '$start_br' is not tracking a remote!\n" if ( $safe_git->KO );
 
   my $br = $start_br;
   while ( $br ne 'master' ) {

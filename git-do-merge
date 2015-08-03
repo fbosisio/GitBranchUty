@@ -109,7 +109,12 @@ my %COLORS = (
   if ( exists($OPTIONS{author}) ) {
     push( @commit_opts, "--author='$OPTIONS{author}'" );
   }
-  $git_d->commit( @commit_opts );
+  $git_ds->commit( @commit_opts );
+  if ( $git_ds->KO ) {
+    print "FATAL: git commit failed! Forcing merge abort ...\n\n";
+    &AbortMerge( $git_d );
+    exit 2;
+  }
 
 } # -----[ main ]-----
 

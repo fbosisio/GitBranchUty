@@ -408,29 +408,62 @@ sub IsCheckoutNeeded {
 
 #==============================================================================
 
+sub GitGetCommitParents {
+  # ----- Function arguments -----
+  my( $commit ) = @_;
+  # ----- Local variables -----
+  my @parents = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $GIT_R->cat_file( $fh, '-p', $commit );
+    while ( my $line = <$fh> ) {
+      push( @parents, $1 ) if ( $line =~ /^parent\s+(\w+)\s*$/ );
+    }
+  $GIT_R->Close( $fh );
+  # ----- Return value -----
+  @parents;
+}
+
+#==============================================================================
+
+sub CommitRangeIncludesAMerge {
+  # ----- Function arguments -----
+  my( $start_commit, $end_commit ) = @_;
+  # ----- Function code -----
+  # Go backward from "end-commit", until "start-commit" is reached
+  # (or a merge-commit is encountered)
+  my $commit = $end_commit;
+  while ( $commit ne $start_commit ) {
+    my @parents = &GitGetCommitParents( $commit );
+    return TRUE if ( $#parents > 1 ); # Merge-commit --> we can stop search
+    $commit = $parents[0];
+  } # END while
+  # ----- Return value -----
+  FALSE; # No merge-commit found
+}
+
+#==============================================================================
+
 sub ExecuteGitPull {
   # ----- Function arguments -----
   my( $branch_name, $remote, $br_hash, $remote_name, $ancestor_hash ) = @_;
   # ----- Function code -----
-#  my $use_rebase = $OPTIONS{rebase};
-#  if ( $use_rebase && &CommitRangeIncludesAMerge($ancestor_hash,$br_hash) ) {
-#    # It seems better not to rebase a merge-commit ...
-#    # ... or can we use 'git rebase -p' to preserve merges ???
-#    print "Option '--rebase' ignored since '$branch_name' includes a merge.\n";
-#    $use_rebase = FALSE;
-#  }
+  my $use_rebase = $OPTIONS{rebase};
+  if ( $use_rebase && &CommitRangeIncludesAMerge($ancestor_hash,$br_hash) ) {
+    # It seems better not to rebase a merge-commit ...
+    # ... or can we use 'git rebase -p' to preserve merges ???
+    print "Option '--rebase' ignored since '$branch_name' includes a merge.\n";
+    $use_rebase = FALSE;
+  }
 
   my @opts = ( '--pretty' );
   push( @opts, '--verbose' ) if ( $OPTIONS{verbose} );
   push( @opts, '--dryrun' ) if ( $OPTIONS{dryrun} );
 
-#  if ( $use_rebase ) {
-#    &SubInfo( "Running 'git pull --rebase'" );
-#    $GIT_D->pull( '--rebase' );
-  if ( $OPTIONS{rebase} ) {
+  if ( $use_rebase ) {
     &SubInfo( "Running 'git do-rebase'" );
     # Here we use "$GIT_R" since we also pass "--dryrun" option (if present)
-    $GIT_R->do_rebase( @opts, '-p', $remote ); # '-p' means "preserve merges"
+    $GIT_R->do_rebase( @opts, '-p', $remote );
   } else {
     push( @opts, "--author='$OPTIONS{author}'" ) if ( $OPTIONS{author} );
     unless ( exists($STATUS{fetch_host}) ) {

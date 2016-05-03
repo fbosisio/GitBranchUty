@@ -37,6 +37,15 @@ my %COLORS = (
   my $git_rs = $git_r->new( stopOnErrors => FALSE );
   my $git_ds = $git_d->new( stopOnErrors => FALSE );
 
+  &Info( 'Checking "git status" [this may take a while]' );
+  my $starting_clean = $git_r->StatusIsClean;
+  unless ( $starting_clean ) {
+    &Info( 'Stashing local changes' );
+    $git_d->stash( 'save' );
+    &Info( 'Checking "git status" again (for safety)' );
+    die "git status is not clean after git stash!\n" if ( !$git_d->StatusIsClean );
+  }
+
   my $curr_br = $git_r->CurrentBranch;
 
   &Info( "Rebasing branch '$curr_br' on top of '$br_to_rebase'" );
@@ -53,6 +62,10 @@ my %COLORS = (
     if ( $git_rs->KO ) {
       &Info( "Running 'git rebase --abort' to undo the rebase" );
       $git_d->rebase( '--abort' );
+      unless ( $starting_clean ) {
+        &Info( 'Restoring stashed changes' );
+        $git_d->stash( 'pop' );
+      }
       exit 1;
     }
 
@@ -73,10 +86,19 @@ my %COLORS = (
         print "OK, aborting.\n";
         &Info( "Running 'git rebase --abort' to undo the rebase" );
         $git_d->rebase( '--abort' );
+        unless ( $starting_clean ) {
+          &Info( 'Restoring stashed changes' );
+          $git_d->stash( 'pop' );
+        }
         exit 2;
       }
     }
   } # END while
+
+  unless ( $starting_clean ) {
+    &Info( 'Restoring stashed changes' );
+    $git_d->stash( 'pop' );
+  }
 
 } # -----[ main ]-----
 
@@ -191,6 +213,27 @@ sub RebaseInProgress {
   # ----- Return value -----
   ##-f "$git_dir/REBASE_HEAD";
   -d "$git_dir/rebase-merge" or -d "$git_dir/rebase-apply";
+}
+
+#------------------------------------------------------------------------------
+
+sub StatusIsClean {
+  # ----- Function arguments -----
+  my( $self ) = @_;
+  # ----- Local variables -----
+  my @status = ();
+  # ----- Function code -----
+  my $fh = new IO::Handle;
+  $self->status( $fh, '--untracked-files=no' );
+    while ( my $line = <$fh> ) {
+      if ( $line =~ /nothing\s+to\s+commit/ ) { @status = (); last; }
+      push( @status, $line );
+    }
+  $self->Close( $fh );
+  # Print command-output (if status is clean, list is empty so print nothing)
+  foreach my $line (@status) { print $line; }
+  # ----- Return value -----
+  ( $#status < 0 );
 }
 
 #------------------------------------------------------------------------------

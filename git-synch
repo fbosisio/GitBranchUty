@@ -81,6 +81,13 @@ my $GIT_D = undef;
     my $branch = $branch_list[0];
     if ( ! defined($branch) ) {
       $branch = $STATUS{orig_branch} = $GIT_R->CurrentBranch;
+      unless ( defined($remote) ) {
+        my $safe_git = $GIT_R->new( stopOnErrors => FALSE );
+        $remote = $safe_git->UpstreamBranch( $branch );
+        die "\nSorry, no branch and no remote specified on command-line,\n" .
+            "and current branch '$branch' is not tracking any remote:\n" .
+            "nothing to synch.\n\n" if ( $safe_git->KO );
+      }
     }
     &SynchBranch( $branch, $remote );
   }

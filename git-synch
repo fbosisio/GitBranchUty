@@ -79,15 +79,25 @@ my $GIT_D = undef;
     } # END foreach
   } else { # Process just a single branch (the only one listed or the current)
     my $branch = $branch_list[0];
-    if ( ! defined($branch) ) {
+    unless ( defined($branch) ) {
       $branch = $STATUS{orig_branch} = $GIT_R->CurrentBranch;
-      unless ( defined($remote) ) {
-        my $safe_git = $GIT_R->new( stopOnErrors => FALSE );
-        $remote = $safe_git->UpstreamBranch( $branch );
-        die "\nSorry, no branch and no remote specified on command-line,\n" .
-            "and current branch '$branch' is not tracking any remote:\n" .
-            "nothing to synch.\n\n" if ( $safe_git->KO );
+    }
+    unless ( defined($remote) ) {
+      my $safe_git = $GIT_R->new( stopOnErrors => FALSE );
+      $remote = $safe_git->UpstreamBranch( $branch );
+      my $failed = $safe_git->KO;
+      if ( $failed && $OPTIONS{mode} =~ /^(?:check|pull|ask|mixed)$/ ) {
+        my $parent_br_out = $safe_git->parent_branch( $branch );
+        if ( $parent_br_out =~ /sub-branch of '(.*)' / ) {
+          $branch = $1;
+          $remote = undef;
+          $failed = FALSE;
+          print $parent_br_out, " Trying to synch '$branch' instead ...\n";
+        }
       }
+      die "\nSorry, no remote specified on command-line, and\n" .
+          "branch '$branch' is not tracking any remote:\n" .
+          "nothing to synch.\n\n" if ( $failed );
     }
     &SynchBranch( $branch, $remote );
   }

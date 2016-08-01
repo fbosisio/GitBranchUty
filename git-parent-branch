@@ -23,12 +23,14 @@ use constant FALSE => (! TRUE);
   }
 
   my @tracked = $git->TrackedBranches;
+  # N.B.: now this becomes an UNSAFE git instance (it will stop on errors)
+  $git->Options( stopOnErrors => TRUE );
   my( $nearest, $forw_dist ) = &GitNearestBranches( $git, $curr_br, \@tracked, TRUE );
   my( $candidates, $rev_dist ) = &GitNearestBranches( $git, $curr_br, $nearest, FALSE );
 
   if ( $#{$candidates} == 0 ) {
     my $branch = $candidates->[0];
-    print "Branch '$curr_br' seems a sub-branch of '$branch' (divereged by $forw_dist and $rev_dist commits).\n";
+    print "Branch '$curr_br' seems a sub-branch of '$branch' (diverged by $forw_dist and $rev_dist commits).\n";
   } elsif ( $#{$candidates} > 0 ) {
     print "Candidates parent branches for '$curr_br' are:\n\t",
           join("\n\t",@{$candidates}), "\n";
